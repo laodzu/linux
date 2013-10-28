@@ -173,6 +173,7 @@ static int dw8250_probe_of(struct uart_port *p,
 	struct device_node	*np = p->dev->of_node;
 	u32			val;
 	bool has_ucv = true;
+	struct uart_8250_port *up;
 
 	if (of_device_is_compatible(np, "cavium,octeon-3860-uart")) {
 #ifdef __BIG_ENDIAN
@@ -218,6 +219,19 @@ static int dw8250_probe_of(struct uart_port *p,
 		return -EINVAL;
 	}
 	p->uartclk = val;
+
+	/* have the 8250 core use DMA for UART operations when the
+	 * device tree contains specs to lookup DMA channels */
+	if (of_find_property(np, "dmas", NULL)) {
+		up = container_of(p, struct uart_8250_port, port);
+
+		up->dma = devm_kzalloc(p->dev, sizeof(*up->dma), GFP_KERNEL);
+		if (!up->dma)
+			return -ENOMEM;
+
+		up->dma->rxconf.src_maxburst = p->fifosize / 4;
+		up->dma->txconf.dst_maxburst = p->fifosize / 4;
+	}
 
 	return 0;
 }
