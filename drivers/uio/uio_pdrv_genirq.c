@@ -25,6 +25,7 @@
 #include <linux/slab.h>
 
 #include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 
@@ -120,6 +121,7 @@ static int uio_pdrv_genirq_probe(struct platform_device *pdev)
 		}
 		uioinfo->name = pdev->dev.of_node->name;
 		uioinfo->version = "devicetree";
+		uioinfo->irq = irq_of_parse_and_map(pdev->dev.of_node, 0);
 		/* Multiple IRQs are not supported */
 	}
 
@@ -146,7 +148,8 @@ static int uio_pdrv_genirq_probe(struct platform_device *pdev)
 	priv->flags = 0; /* interrupt is enabled to begin with */
 	priv->pdev = pdev;
 
-	if (!uioinfo->irq) {
+	/* only consult the platform for interrupts in the non-DT case */
+	if (!pdev->dev.of_node && !uioinfo->irq) {
 		ret = platform_get_irq(pdev, 0);
 		uioinfo->irq = ret;
 		if (ret == -ENXIO && pdev->dev.of_node)
