@@ -48,15 +48,6 @@
 			};
 		};
 
-		ethernet@ff700000 {
-			status = "disabled";
-		};
-
-		ethernet@ff702000 {
-			phy-mode = "rgmii";
-			phy-addr = <0xffffffff>; /* probe for phy addr */
-		};
-
 		qspi: spi@ff705000 {
 				compatible = "cadence,qspi";
 				#address-cells = <1>;
@@ -126,18 +117,97 @@
 			clock-frequency = <100000000>;
 		};
 
-		i2c0: i2c@ffc04000 {
-			speed-mode = <0>;
-		};
-
 		uio-gpio@ff2000000 {
 			compatible = "generic-uio";
 			reg = <0xff200000 0x20>;
 		};
+
+		framebuffer {
+			compatible = "simple-framebuffer";
+			reg = <0x3f000000 (800 * 480 * 4)>;
+			width = <800>;
+			height = <480>;
+			stride = <(800 * 4)>;
+			format = "a8r8g8b8";
+		};
+
+		leds {
+			compatible = "gpio-leds";
+
+			hps0 {
+				label = "hps_led0";
+				gpios = <&gpio0 28 1>;
+			};
+
+			hps1 {
+				label = "hps_led1";
+				gpios = <&gpio1 19 1>;
+			};
+
+			hps2 {
+				label = "hps_led2";
+				gpios = <&gpio1 25 1>;
+			};
+		};
+
+		keys {
+			compatible = "gpio-keys-polled";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			poll-interval = <100>;
+
+			up {
+				label = "joystick up";
+				linux,code = <0x67>;
+				gpios = <&gpio2 19 0>;
+			};
+
+			down {
+				label = "joystick down";
+				linux,code = <0x6a>;
+				gpios = <&gpio2 20 0>;
+			};
+
+			left {
+				label = "joystick left";
+				linux,code = <0x69>;
+				gpios = <&gpio2 24 0>;
+			};
+
+			right {
+				label = "joystick right";
+				linux,code = <0x6c>;
+				gpios = <&gpio2 23 0>;
+			};
+
+			button {
+				label = "joystick button";
+				linux,code = <0x1c>;
+				gpios = <&gpio2 15 0>;
+			};
+		};
 	};
 };
 
+&gmac1 {
+	phy-mode = "rgmii";
+	snps,phy-addr = <0xffffffff>; /* probe for phy addr */
+	rxd0-skew-ps = <0>;
+	rxd1-skew-ps = <0>;
+	rxd2-skew-ps = <0>;
+	rxd3-skew-ps = <0>;
+	txen-skew-ps = <0>;
+	txc-skew-ps = <2600>;
+	rxdv-skew-ps = <0>;
+	rxc-skew-ps = <2000>;
+	snps,max-mtu = <4062>;
+	status = "okay";
+};
+
 &i2c0 {
+	speed-mode = <0>;
+	status = "okay";
+
 	eeprom@51 {
 		compatible = "atmel,24c32";
 		reg = <0x51>;
