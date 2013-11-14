@@ -227,6 +227,11 @@
 		pagesize = <32>;
 	};
 
+	eeprom@56 {
+		compatible = "atmel,24c01";
+		reg = <0x56>;
+	};
+
 	rtc@68 {
 		compatible = "stm,m41t82";
 		reg = <0x68>;
