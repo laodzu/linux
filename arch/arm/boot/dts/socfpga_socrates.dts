@@ -238,6 +238,16 @@
 	};
 };
 
+&i2c1 {
+	speed-mode = <0>;
+	status = "okay";
+
+	eeprom@56 {
+		compatible = "atmel,24c01";
+		reg = <0x56>;
+	};
+};
+
 &spi0 {
 	/* add GPIO09 as potential CS line */
 	cs-gpios = <0>, <0>, <0>, <0>, <&gpio0 9 0>;
