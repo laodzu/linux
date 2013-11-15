@@ -232,3 +232,15 @@
 		reg = <0x68>;
 	};
 };
+
+&spi0 {
+	/* add GPIO09 as potential CS line */
+	cs-gpios = <0>, <&gpio0 9 0>, <0>, <0>;
+
+	/* attach spidev(4) on CS 1 */
+	spidev@1 {
+		compatible = "spidev";
+		reg = <1>;
+		spi-max-frequency = <10000000>;
+	};
+};

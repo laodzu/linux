@@ -159,6 +159,9 @@ struct dw_spi {
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs;
 #endif
+	void			(*extra_cs_control)(struct dw_spi *dws,
+						    struct spi_device *spi,
+						    bool on);
 };
 
 static inline u32 dw_readl(struct dw_spi *dws, u32 offset)
@@ -193,8 +196,19 @@ static inline void spi_set_clk(struct dw_spi *dws, u16 div)
 
 static inline void spi_chip_sel(struct dw_spi *dws, u16 cs)
 {
-	if (cs > dws->num_cs)
-		return;
+	if (cs >= dws->num_cs) {
+		/* it appears that the SPI controller (or the driver
+		 * code controlling it) gets stuck if the slave's CS
+		 * number is not within the range of those which the SPI
+		 * hardware controls -- so let's fake a CS number such
+		 * that the transfer works because the driver will
+		 * always activate one of its internal bits, use the
+		 * last hardware controlled CS line assuming that these
+		 * get assigned from left to right and that nothing is
+		 * connected to the last one in the presence of
+		 * additional GPIO controlled CS lines */
+		cs = dws->num_cs - 1;
+	}
 
 	if (dws->cs_control)
 		dws->cs_control(1);

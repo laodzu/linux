@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/highmem.h>
 #include <linux/delay.h>
+#include <linux/gpio.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/of.h>
@@ -323,6 +324,16 @@ static void giveback(struct dw_spi *dws)
 	if (!last_transfer->cs_change && dws->cs_control)
 		dws->cs_control(MRST_SPI_DEASSERT);
 
+	/*
+	 * de-assert CS (which may be external to the SPI controller,
+	 * like GPIO based) after transmission of the message has
+	 * completed (does not hurt when the end of a partial transfer
+	 * already de-asserted CS)
+	 */
+	if (dws->extra_cs_control)
+		dws->extra_cs_control(dws, msg->spi, 0);
+
+	/* notify the caller about completion of the transmission */
 	msg->state = NULL;
 	if (msg->complete)
 		msg->complete(msg->context);
@@ -453,17 +464,27 @@ static void pump_transfers(unsigned long data)
 
 	/* Handle end of message */
 	if (message->state == DONE_STATE) {
+		/*
+		 * XXX to reconsider: is this not a "regular completion"
+		 * of "a transfer", while it "just happens to be the
+		 * last transfer of a message"?  i.e. we should not
+		 * ignore caller specified delay and CS change requests
+		 * here, neither should their execution be duplicated
+		 * among "between transfers" and "after the message"
+		 */
 		message->status = 0;
 		goto early_exit;
 	}
 
-	/* Delay if requested at end of transfer*/
+	/* delay after transferred data and toggle CS upon caller's request */
 	if (message->state == RUNNING_STATE) {
 		previous = list_entry(transfer->transfer_list.prev,
 					struct spi_transfer,
 					transfer_list);
 		if (previous->delay_usecs)
 			udelay(previous->delay_usecs);
+		if (previous->cs_change && dws->extra_cs_control)
+			dws->extra_cs_control(dws, spi, 0);
 	}
 
 	dws->n_bytes = chip->n_bytes;
@@ -545,6 +566,16 @@ static void pump_transfers(unsigned long data)
 		imask |= SPI_INT_TXEI | SPI_INT_TXOI | SPI_INT_RXUI | SPI_INT_RXOI;
 		dws->transfer_handler = interrupt_transfer;
 	}
+
+	/*
+	 * (re-)assert CS (which may be external to the SPI controller,
+	 * like GPIO based) before the next transfer; done here because
+	 * the hardware re-programming below might already result in
+	 * asynchronous communication of the message's/transfer's data,
+	 * and is optional while CS control always should be considered
+	 */
+	if (dws->extra_cs_control)
+		dws->extra_cs_control(dws, spi, 1);
 
 	/*
 	 * Reprogram registers only if
@@ -674,8 +705,31 @@ static int dw_spi_transfer(struct spi_device *spi, struct spi_message *msg)
 /* This may be called twice for each spi dev */
 static int dw_spi_setup(struct spi_device *spi)
 {
+	int ret;
 	struct dw_spi_chip *chip_info = NULL;
 	struct chip_data *chip;
+
+	/* request the GPIO upon first setup */
+	chip = spi_get_ctldata(spi);
+	if (!chip && gpio_is_valid(spi->cs_gpio)) {
+		ret = gpio_request(spi->cs_gpio, dev_name(&spi->dev));
+		if (ret) {
+			dev_err(&spi->dev, "can't get CS gpio %d: %d\n",
+				spi->cs_gpio, ret);
+			return ret;
+		}
+		gpio_direction_output(spi->cs_gpio,
+				      spi->mode & SPI_CS_HIGH ? 0 : 1);
+	}
+
+	/*
+	 * sanity check: high active CS is only valid for GPIOs,
+	 * unsupported for the SPI controller's internal CS lines
+	 */
+	if ((spi->mode & SPI_CS_HIGH) && !gpio_is_valid(spi->cs_gpio)) {
+		dev_err(&spi->dev, "high active CS only valid for GPIO\n");
+		return -EINVAL;
+	}
 
 	/* Only alloc on first setup */
 	chip = spi_get_ctldata(spi);
@@ -736,6 +790,9 @@ static void dw_spi_cleanup(struct spi_device *spi)
 {
 	struct chip_data *chip = spi_get_ctldata(spi);
 	kfree(chip);
+
+	if (gpio_is_valid(spi->cs_gpio))
+		gpio_free(spi->cs_gpio);
 }
 
 static int init_queue(struct dw_spi *dws)
@@ -837,6 +894,32 @@ static void spi_hw_init(struct dw_spi *dws)
 	}
 }
 
+/*
+ * this routine implements support for the OF based cs-gpios approach,
+ * working around the Designware controller's "interesting" CS control
+ * feature which breaks communication with SPI slaves in random ways
+ */
+static void dw_spi_extra_cs_control(struct dw_spi *dws,
+				    struct spi_device *spi, bool on)
+{
+	int lvl;
+
+	if (!dws)
+		return;
+	if (!spi)
+		return;
+
+	if (!gpio_is_valid(spi->cs_gpio))
+		return;
+	if (on)
+		lvl = (spi->mode & SPI_CS_HIGH) ? 1 : 0;
+	else
+		lvl = (spi->mode & SPI_CS_HIGH) ? 0 : 1;
+	dev_dbg(&spi->dev, "%s() gpio[%d] lvl[%d]\n", __func__, spi->cs_gpio, lvl);
+	gpio_set_value(spi->cs_gpio, lvl);
+	return;
+}
+
 int dw_spi_add_host(struct dw_spi *dws)
 {
 	struct spi_master *master;
@@ -865,7 +948,7 @@ int dw_spi_add_host(struct dw_spi *dws)
 		goto err_free_master;
 	}
 
-	master->mode_bits = SPI_CPOL | SPI_CPHA;
+	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH;
 	master->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(16);
 	master->bus_num = dws->bus_num;
 	master->num_chipselect = dws->num_cs;
@@ -873,6 +956,7 @@ int dw_spi_add_host(struct dw_spi *dws)
 	master->setup = dw_spi_setup;
 	master->transfer = dw_spi_transfer;
 	master->dev.of_node = dws->parent_dev->of_node;
+	dws->extra_cs_control = dw_spi_extra_cs_control;
 
 	/* Basic HW init */
 	spi_hw_init(dws);
