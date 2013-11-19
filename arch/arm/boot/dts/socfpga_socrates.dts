@@ -252,6 +252,23 @@
 	/* add GPIO09 as potential CS line */
 	cs-gpios = <0>, <0>, <0>, <0>, <&gpio0 9 0>;
 
+	/* disable spidev(4) on CS 0 */
+	spidev@0 {
+		status = "disabled";
+	};
+
+	/* add an ST93C46 for SPI evaluation */
+	eeprom@0 {
+		compatible = "93xx46";
+		size = <128>;
+		address-width = <16>;
+		// read-only;
+		reg = <0>;
+		spi-cs-high;
+		spi-max-frequency = <100000>;
+	};
+
+	/* attach spidev(4) on CS 1 */
 	spidev@1 {
 		compatible = "spidev";
 		reg = <1>;
