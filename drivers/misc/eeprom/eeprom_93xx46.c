@@ -14,6 +14,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/sysfs.h>
@@ -45,6 +46,7 @@ eeprom_93xx46_bin_read(struct file *filp, struct kobject *kobj,
 	struct spi_transfer t[2];
 	int bits, ret;
 	u16 cmd_addr;
+	u8 cmd_bytes[2];
 
 	dev = container_of(kobj, struct device, kobj);
 	edev = dev_get_drvdata(dev);
@@ -66,20 +68,41 @@ eeprom_93xx46_bin_read(struct file *filp, struct kobject *kobj,
 		bits = 9;
 	}
 
+	/*
+	 * XXX TODO reconsider this bits = 9/10 approach
+	 *
+	 * SPI transfers with bits per word that are not
+	 * multiples of eight?  I don't think so
+	 *
+	 * not only is this not supported by all SPI controllers
+	 * (may only work with bitbanged interfaces), in addition
+	 * the EEPROM does not really need this -- all the slave
+	 * wants is an explicit start bit (a leading bit of high
+	 * level1) after CS has become active
+	 *
+	 * the existing code already did right-adjust the command
+	 * and the address, the command includes the start bit,
+	 * so everything is already in place ...
+	 */
+	bits = 8;	/* hard override */
+
 	dev_dbg(&edev->spi->dev, "read cmd 0x%x, %d Hz\n",
 		cmd_addr, edev->spi->max_speed_hz);
 
 	spi_message_init(&m);
 	memset(t, 0, sizeof(t));
 
-	t[0].tx_buf = (char *)&cmd_addr;
+	cmd_bytes[0] = (cmd_addr >> 8) & 0xff;
+	cmd_bytes[1] = (cmd_addr >> 0) & 0xff;
+	t[0].tx_buf = &cmd_bytes[0];
 	t[0].len = 2;
-	t[0].bits_per_word = bits;
+	// t[0].bits_per_word = bits;
+	t[0].cs_change = 0;
 	spi_message_add_tail(&t[0], &m);
 
 	t[1].rx_buf = buf;
 	t[1].len = count;
-	t[1].bits_per_word = 8;
+	// t[1].bits_per_word = 8;
 	spi_message_add_tail(&t[1], &m);
 
 	mutex_lock(&edev->lock);
@@ -87,7 +110,9 @@ eeprom_93xx46_bin_read(struct file *filp, struct kobject *kobj,
 	if (edev->pdata->prepare)
 		edev->pdata->prepare(edev);
 
+  dev_err(&edev->spi->dev, "%s() reading %d bytes at 0x%x, cmd 0x%x\n", __func__, count, (int)off, cmd_addr);
 	ret = spi_sync(edev->spi, &m);
+  dev_err(&edev->spi->dev, "%s() read rc %d\n", __func__, ret);
 	/* have to wait at least Tcsl ns */
 	ndelay(250);
 	if (ret) {
@@ -309,15 +334,40 @@ static ssize_t eeprom_93xx46_store_erase(struct device *dev,
 }
 static DEVICE_ATTR(erase, S_IWUSR, NULL, eeprom_93xx46_store_erase);
 
+static struct eeprom_93xx46_platform_data of_pd;
+
 static int eeprom_93xx46_probe(struct spi_device *spi)
 {
 	struct eeprom_93xx46_platform_data *pd;
+	struct device_node *np;
+	u32 val;
 	struct eeprom_93xx46_dev *edev;
 	int err;
 
 	pd = spi->dev.platform_data;
+	if (!pd) do {
+		dev_info(&spi->dev, "no platform data, trying OF\n");
+		np = spi->dev.of_node;
+		if (!np)
+			break;
+  dev_info(&spi->dev, "clear\n");
+		memset(&of_pd, 0, sizeof(of_pd));
+		if (of_property_read_u32(np, "address-width", &val))
+			break;
+  dev_info(&spi->dev, "width %d\n", val);
+		if (val == 8)
+			of_pd.flags |= EE_ADDR8;
+		else if (val == 16)
+			of_pd.flags |= EE_ADDR16;
+		else
+			break;
+		if (of_find_property(np, "read-only", NULL))
+			of_pd.flags |= EE_READONLY;
+  dev_info(&spi->dev, "ro %d\n", (of_pd.flags & EE_READONLY) ? 1 : 0);
+		pd = &of_pd;
+	} while (0);
 	if (!pd) {
-		dev_err(&spi->dev, "missing platform data\n");
+		dev_err(&spi->dev, "neither platform data nor OF specs\n");
 		return -ENODEV;
 	}
 
