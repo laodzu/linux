@@ -276,15 +276,9 @@
 	};
 
 	touchscreen@4 {
-		compatible = "lnt_ti1";
+		compatible = "lnt-ti1";
 		reg = <4>;	/* chip select */
 		spi-max-frequency = <4500000>;
-		/* XXX TODO determine whether to lookup the GPIO and
-		 * derive its IRQ spec, or whether to specify the IRQ
-		 * and determine which GPIO to use to fetch its level
-		 * (the former appears more appropriate to me) */
 		gpios = <&gpio1 15 0>;	/* GPIO 44 is pen-down */
-		interrupt-parent = <&gpio1>;
-		interrupts = <15 0>;
 	};
 };

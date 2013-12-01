@@ -873,7 +873,7 @@ static int lnt_ti1_probe(struct spi_device *spi)
 	/* configure the input device */
 	snprintf(ts->phys, sizeof(ts->phys), "%s/input-ts",
 		 dev_name(&spi->dev));
-	input_dev->name = "lnt ti1 touchscreen";
+	input_dev->name = "lnt-ti1 touchscreen";
 	input_dev->phys = ts->phys;
 	input_dev->id.bustype = BUS_SPI;
 	input_dev->dev.parent = &spi->dev;
@@ -961,7 +961,7 @@ static int lnt_ti1_remove(struct spi_device *spi)
 
 static struct spi_driver lnt_ti1_driver = {
 	.driver	= {
-		.name	= "lnt_ti1",
+		.name	= "lnt-ti1",
 		.owner	= THIS_MODULE,
 		.pm	= &lnt_ti1_pm_ops,
 	},
@@ -972,9 +972,9 @@ static struct spi_driver lnt_ti1_driver = {
 module_spi_driver(lnt_ti1_driver);
 
 MODULE_AUTHOR("Gerhard Sittig <gsi@denx.de>");
-MODULE_DESCRIPTION("LNT TI1 Touchscreen Driver");
+MODULE_DESCRIPTION("LNT Automation Touchinterface1 driver");
 MODULE_LICENSE("GPL");	/* Licensed under the GPL-2 or later */
-MODULE_ALIAS("spi:lnt_ti1");
+MODULE_ALIAS("spi:lnt-ti1");
 
 /*
  * vim:foldmethod=marker textwidth=72

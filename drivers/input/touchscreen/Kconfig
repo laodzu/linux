@@ -357,8 +357,8 @@ config TOUCHSCREEN_LNT_TI1
 	tristate "LNT Automation Touchinterface1"
 	depends on SPI_MASTER
 	help
-	  Say Y here if hou have an LNT TI1 touchscreen controller
-	  connected via SPI.
+	  Say Y here if you have a Touchinterface1 controller made by
+	  LNT Automation GmbH that is connected via SPI and GPIO.
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called lnt_ti1.
