@@ -221,30 +221,9 @@
 	speed-mode = <0>;
 	status = "okay";
 
-	eeprom@51 {
-		compatible = "atmel,24c32";
-		reg = <0x51>;
-		pagesize = <32>;
-	};
-
-	eeprom@56 {
-		compatible = "atmel,24c01";
-		reg = <0x56>;
-	};
-
 	rtc@68 {
 		compatible = "stm,m41t82";
 		reg = <0x68>;
-	};
-};
-
-&i2c1 {
-	speed-mode = <0>;
-	status = "okay";
-
-	eeprom@56 {
-		compatible = "atmel,24c01";
-		reg = <0x56>;
 	};
 };
 
@@ -252,33 +231,15 @@
 	/* add GPIO09 as potential CS line */
 	cs-gpios = <0>, <0>, <0>, <0>, <&gpio0 9 0>;
 
-	/* disable spidev(4) on CS 0 */
-	spidev@0 {
-		status = "disabled";
-	};
-
-	/* add an ST93C46 for SPI evaluation */
-	eeprom@0 {
-		compatible = "93xx46";
-		size = <128>;
-		address-width = <16>;
-		// read-only;
-		reg = <0>;
-		spi-cs-high;
-		spi-max-frequency = <100000>;
-	};
-
-	/* attach spidev(4) on CS 1 */
-	spidev@1 {
-		compatible = "spidev";
-		reg = <1>;
-		spi-max-frequency = <10000000>;
-	};
-
 	touchscreen@4 {
 		compatible = "lnt-ti1";
 		reg = <4>;	/* chip select */
 		spi-max-frequency = <4500000>;
 		gpios = <&gpio1 15 0>;	/* GPIO 44 is pen-down */
 	};
+};
+
+&usb1 {
+      status = "okay";
+      ulpi-ddr = <0>;
 };
