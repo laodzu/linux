@@ -105,6 +105,7 @@
 #define LNT_TI1_SPI_2x_GET_VERSION	1
 #define LNT_TI1_SPI_2x_GET_SETTINGS	1
 #define LNT_TI1_SPI_DEFERRED_RESPONSE	1
+#define LNT_TI1_SPI_RX_DURING_CMD_TX	1
 #define LNT_TI1_SPI_CMD_REFLECTION	1
 #define LNT_TI1_SPI_FAKE_SAMPLE_DATA	0
 
@@ -229,6 +230,16 @@ static int lnt_ti1_command(struct lnt_ti1 *ts, enum lnt_ti1_cmd_t cmd,
 		xfercmd.delay_usecs = LNT_TI1_SPI_CMD_DATA_MSECS * 1000;
 		spi_message_add_tail(&xferdat, &msg);
 	}
+#if LNT_TI1_SPI_RX_DURING_CMD_TX
+	/* receive the first byte already at the time when the command
+	 * is sent out, the (optional) second partial transfer only
+	 * communicates the remainder starting at the second RX byte */
+	xfercmd.rx_buf = xferdat.rx_buf;
+	if (rxdlen) {
+		xferdat.rx_buf++;
+		xferdat.len--;
+	}
+#endif
 
 	rc = spi_sync(ts->spi, &msg);
 	if (rc) {
