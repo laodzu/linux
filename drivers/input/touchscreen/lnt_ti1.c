@@ -105,6 +105,7 @@
 #define LNT_TI1_SPI_2x_GET_VERSION	1
 #define LNT_TI1_SPI_2x_GET_SETTINGS	1
 #define LNT_TI1_SPI_DEFERRED_RESPONSE	1
+#define LNT_TI1_SPI_CMD_REFLECTION	1
 #define LNT_TI1_SPI_FAKE_SAMPLE_DATA	0
 
 /* XXX TODO (non-consuming) verification of the response packet
@@ -353,10 +354,17 @@ static bool lnt_ti1_process_header(struct lnt_ti1 *ts,
 	 * - 8bit, status (active aka initialized) and heartbeat
 	 *   (free running counter, non-zero when active)
 	 */
+#if LNT_TI1_SPI_CMD_REFLECTION
 	if (*dlen < 2)
 		return false;
 	b = get_u8(data, dlen);
 	if (b != want_cmd)
+		return false;
+#else
+	(void)want_cmd;
+#endif
+
+	if (*dlen < 1)
 		return false;
 	b = get_u8(data, dlen);
 	if (!HEADER_STATUS_GET_ACTIVE(b))
