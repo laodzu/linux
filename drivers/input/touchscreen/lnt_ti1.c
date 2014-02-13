@@ -298,6 +298,7 @@ static void lnt_ti1_update_pen_state(struct lnt_ti1 *ts,
 				     int id, int down)
 {
 	if (lnt_ti1_mtouch) {
+		/* multi touch mode, report all events */
 		input_mt_slot(ts->idev, id);
 		input_mt_report_slot_state(ts->idev, MT_TOOL_FINGER, !!down);
 		if (down) {
@@ -306,7 +307,8 @@ static void lnt_ti1_update_pen_state(struct lnt_ti1 *ts,
 			input_report_abs(ts->idev, ABS_MT_PRESSURE, press);
 		}
 		input_mt_report_pointer_emulation(ts->idev, true);
-	} else {
+	} else if (!id) {
+		/* no multi touch mode, report 0th finger only */
 		if (down) {
 			input_report_abs(ts->idev, ABS_X, x);
 			input_report_abs(ts->idev, ABS_Y, y);
@@ -417,8 +419,10 @@ static bool lnt_ti1_process_sample(struct lnt_ti1 *ts,
 	raw_y = get_u16_le(data, dlen);
 	if (!(raw_status & SAMPLE_STATUS_IS_VALID))
 		return false;
+	if (!SAMPLE_TOUCH_GET_COUNT(raw_touches))
+		return true;
 	pressure = ts->max_p;
-	finger = raw_touches;
+	finger = SAMPLE_TOUCH_GET_NUMBER(raw_touches);
 	down = !!(raw_status & SAMPLE_STATUS_IS_PRESSED);
 	spin_lock_irqsave(&ts->lock, flags);
 	lnt_ti1_update_pen_state(ts, raw_x, raw_y, pressure, finger, down);
