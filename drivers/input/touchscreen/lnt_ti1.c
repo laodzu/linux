@@ -112,7 +112,7 @@
 /* XXX TODO (non-consuming) verification of the response packet
  * (CRC check upon lnt_ti1_command() invocations) */
 
-static int lnt_ti1_diag = 2;
+static int lnt_ti1_diag = 1;
 module_param_named(diag, lnt_ti1_diag, int, 0);
 MODULE_PARM_DESC(diag, "verbosity level of diagnostics output");
 
