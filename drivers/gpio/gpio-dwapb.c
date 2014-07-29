@@ -428,7 +428,21 @@ static struct platform_driver dwapb_gpio_driver = {
 	.remove		= dwapb_gpio_remove,
 };
 
-module_platform_driver(dwapb_gpio_driver);
+/*
+ * initialize early, to make the IRQ controllers available
+ * before other components start referencing them
+ */
+static int __init dwapb_gpio_init(void)
+{
+	return platform_driver_register(&dwapb_gpio_driver);
+}
+subsys_initcall(dwapb_gpio_init);
+
+static void __exit dwapb_gpio_exit(void)
+{
+	platform_driver_unregister(&dwapb_gpio_driver);
+}
+module_exit(dwapb_gpio_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jamie Iles");
