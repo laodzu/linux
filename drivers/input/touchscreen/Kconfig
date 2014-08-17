@@ -365,6 +365,16 @@ config TOUCHSCREEN_LNT_TI1
 	  To compile this driver as a module, choose M here: the
 	  module will be called lnt_ti1.
 
+config TOUCHSCREEN_LNT_TI1_SERIO
+	tristate "support serio (UART) connection"
+	depends on TOUCHSCREEN_LNT_TI1 && SERIO
+	help
+	  Say Y here if you have the LNT Touchinterface 1 controller
+	  connected to a UART.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called lnt_ti1_serio.
+
 config TOUCHSCREEN_LNT_TI1_SPI
 	tristate "support SPI bus connection"
 	depends on TOUCHSCREEN_LNT_TI1 && SPI_MASTER
