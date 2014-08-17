@@ -365,6 +365,16 @@ config TOUCHSCREEN_LNT_TI1
 	  To compile this driver as a module, choose M here: the
 	  module will be called lnt_ti1.
 
+config TOUCHSCREEN_LNT_TI1_SPI
+	tristate "support SPI bus connection"
+	depends on TOUCHSCREEN_LNT_TI1 && SPI_MASTER
+	help
+	  Say Y here if you have the LNT Touchinterface 1 controller
+	  connected to an SPI bus.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called lnt_ti1_spi.
+
 config TOUCHSCREEN_LPC32XX
 	tristate "LPC32XX touchscreen controller"
 	depends on ARCH_LPC32XX

@@ -55,6 +55,50 @@
  * after e.g. ESD events or other issues, too.
  */
 
+/*
+ * Implementer's note on the SPI transfer:
+ *
+ * There is a rather silly issue in the initial firmware's
+ * implementation of the SPI communication.  Each command is
+ * communicated within a single SPI transfer, including both the request
+ * and the response parts of the command.  Since the firmware takes time
+ * to respond to a request, and the master initiates communication and
+ * provides the clock, the following (undocumented) requirement applies:
+ * An SPI transfer does communicate a request as well as a response, but
+ * the response in a transfer corresponds to the request that was
+ * communicated in a previous transfer.
+ *
+ * This is especially annoying because this SPI transport's "feature"
+ * transpires into upper layers in the common logic, and requires the
+ * driver to "anticipate" the next type of command.  This "ask one
+ * question, get the response to another question" pattern is used here
+ * in the touch mode, where only two alternating commands are sent.  For
+ * other commands during initialization, a brute force approach of
+ * sending all commands twice might be used, to only inspect the second
+ * response which does answer the duplicated question.  Unfortunately
+ * the simple brute force approach of asking each question twice cannot
+ * be used for touch samples, because the first and ignored response
+ * would carry information that is not repeated in the second response,
+ * so touch samples would be lost.
+ *
+ * Unfortunately there is no NOP command either, that would allow for
+ * the emulation of a "normal" mode of communication.
+ *
+ * Because the current status of the firmware is uncertain (documented
+ * commands are not implemented, or their implementation differs from
+ * the documentation, or required information that is located outside of
+ * the firmware image is not available, or test firmware does not apply
+ * constraints that a regular firmware would enforce), the handling of
+ * the above requirement might need re-consideration, and adjustment in
+ * more source locations.
+ *
+ * But the better approach would be to eliminate this arbitrary and
+ * unnecessary constraint.  And to adjust the controller firmware such
+ * that two SPI transfers with a delay are used, to communicate the
+ * request and the response in them respectively.  Very much how the I2C
+ * transport is supposed to work.
+ */
+
 static int lnt_ti1_diag;
 module_param_named(diag, lnt_ti1_diag, int, 0);
 MODULE_PARM_DESC(diag, "verbosity level of diagnostics output");
@@ -98,11 +142,12 @@ struct lnt_ti1 {
 	bool is_pendown;
 	struct timer_list penup_timer;
 	int event_count;
+	bool deferred_response;
 };
 
 /* This routine sends a command, and retrieves response data. */
-static int lnt_ti1_command(struct lnt_ti1 *ts, enum lnt_ti1_cmd_t cmd,
-			   uint8_t *rxdata, size_t rxdlen)
+static int lnt_ti1_command_int(struct lnt_ti1 *ts, enum lnt_ti1_cmd_t cmd,
+			       uint8_t *rxdata, size_t rxdlen)
 {
 	int rc;
 	uint8_t got, want;
@@ -140,6 +185,46 @@ static int lnt_ti1_command(struct lnt_ti1 *ts, enum lnt_ti1_cmd_t cmd,
 	}
 
 	return 0;
+}
+
+static int lnt_ti1_command(struct lnt_ti1 *ts, enum lnt_ti1_cmd_t cmd,
+			   uint8_t *rxdata, size_t rxdlen)
+{
+	int do_two_calls;
+
+	/*
+	 * The "deferred response" constraint requires the driver to
+	 * "anticipate" which command might need to get sent next.  This
+	 * is especially cumbersome in the initialization phase, or when
+	 * changing modes of operation in the controller while the
+	 * previous communication just is not known (was not tracked).
+	 *
+	 * For idempotent operations a brute force approach is taken,
+	 * simply asking the same question two times, assuming that the
+	 * second response will have the answer to the question.  In this
+	 * scenario, errors in the first transmission are ignored (it's
+	 * actually expected to not be able to parse the first response
+	 * in conformance to the request).
+	 */
+	if (ts->deferred_response) {
+		switch (cmd) {
+		case LNT_TI1_CMD_GET_VERSION:
+		case LNT_TI1_CMD_GET_SETTINGS:
+		case LNT_TI1_CMD_MODE_TOUCH:
+		case LNT_TI1_CMD_MODE_CONFIG:
+			do_two_calls = 1;
+			break;
+		default:
+			do_two_calls = 0;
+			break;
+		}
+		if (do_two_calls) {
+			lnt_ti1_command_int(ts, cmd, rxdata, rxdlen);
+		}
+	}
+	/* end of two-call workaround */
+
+	return lnt_ti1_command_int(ts, cmd, rxdata, rxdlen);
 }
 
 static void lnt_ti1_check_heartbeat(struct lnt_ti1 *ts, int stamp)
@@ -424,19 +509,51 @@ static int lnt_ti1_get_samples(struct lnt_ti1 *ts)
 	 */
 	buffoff = 0;
 
-	chunklen = 10;
-	rc = lnt_ti1_command(ts, LNT_TI1_CMD_GET_SAMPLE_0,
-			     buff + buffoff, chunklen);
-	if (rc)
-		return rc;
-	buffoff += chunklen;
+	if (ts->deferred_response) {
+		/*
+		 * This is the "deferred response" mode of the SPI
+		 * transport.  Communicating a request results in that
+		 * request getting queued, while the response within
+		 * that very transfer carries data for a previously
+		 * communicated request.
+		 *
+		 * In touch mode, the "first sample" and "next samples"
+		 * requests are communicated in a strictly alternating
+		 * pattern.  So we emit the requests "in inverse order",
+		 * to receive the response data in the expected order.
+		 *
+		 * Yes, this stupid constraint should go away, which is
+		 * why this branch is optional.  Later firmware might
+		 * implement a more sane approach to SPI communication.
+		 */
+		chunklen = 10;
+		rc = lnt_ti1_command(ts, LNT_TI1_CMD_GET_SAMPLE_9,
+				     buff + buffoff, chunklen);
+		if (rc)
+			return rc;
+		buffoff += chunklen;
 
-	chunklen = 58;
-	rc = lnt_ti1_command(ts, LNT_TI1_CMD_GET_SAMPLE_9,
-			     buff + buffoff, chunklen);
-	if (rc)
-		return rc;
-	buffoff += chunklen;
+		chunklen = 58;
+		rc = lnt_ti1_command(ts, LNT_TI1_CMD_GET_SAMPLE_0,
+				     buff + buffoff, chunklen);
+		if (rc)
+			return rc;
+		buffoff += chunklen;
+	} else {
+		chunklen = 10;
+		rc = lnt_ti1_command(ts, LNT_TI1_CMD_GET_SAMPLE_0,
+				     buff + buffoff, chunklen);
+		if (rc)
+			return rc;
+		buffoff += chunklen;
+
+		chunklen = 58;
+		rc = lnt_ti1_command(ts, LNT_TI1_CMD_GET_SAMPLE_9,
+				     buff + buffoff, chunklen);
+		if (rc)
+			return rc;
+		buffoff += chunklen;
+	}
 
 	/*
 	 * Interpret the response which consists of the two chunks.
@@ -742,6 +859,15 @@ static void lnt_ti1_penup_timer(unsigned long data)
 static void lnt_ti1_start_scan(struct lnt_ti1 *ts)
 {
 	(void)lnt_ti1_command(ts, LNT_TI1_CMD_MODE_TOUCH, NULL, 0);
+
+	/*
+	 * The "deferred response" constraint requires us to send out a
+	 * "first sample" request here already, such that the subsequent
+	 * transfer in the ISR handler will receive a response that
+	 * corresponds to this request.
+	 */
+	if (ts->deferred_response)
+		(void)lnt_ti1_command(ts, LNT_TI1_CMD_GET_SAMPLE_0, NULL, 0);
 }
 
 static void lnt_ti1_stop_scan(struct lnt_ti1 *ts)
@@ -837,6 +963,23 @@ struct lnt_ti1 *lnt_ti1_probe(struct device *dev,
 		goto err_free_mem;
 	}
 	ts->idev = input_dev;
+
+	/*
+	 * All current firmware versions do implement the "deferred
+	 * response" approach when communicating over the SPI transport.
+	 * None of the current firmware versions can get identified.  So
+	 * the workaround depends on SPI only, no other condition is
+	 * available to determine whether the workaround is needed.
+	 *
+	 * Beware that _if_ the "deferred response" condition would
+	 * depend on the firmware version, we don't have it available
+	 * here yet.  And to fetch the version information, we had to
+	 * communicate to the controller, and would need to know how to
+	 * communicate, and thus would need to know which version the
+	 * controller has, before getting its version information. :-O
+	 */
+	if (busops->bustype == BUS_SPI)
+		ts->deferred_response = true;
 
 	/*
 	 * Enforce config mode here as the first action, because current
