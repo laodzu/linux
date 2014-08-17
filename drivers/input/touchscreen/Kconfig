@@ -353,6 +353,18 @@ config TOUCHSCREEN_WACOM_I2C
 	  To compile this driver as a module, choose M here: the module
 	  will be called wacom_i2c.
 
+config TOUCHSCREEN_LNT_TI1
+	tristate "LNT Automation Touchinterface 1"
+	help
+	  Say Y here if you have a Touchinterface 1 controller made by
+	  LNT Automation GmbH.  This is the core driver which implements
+	  logic that is common to several variants of the touchscreen.
+	  Additional drivers for specific transports are required before
+	  the touchscreen becomes operational.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called lnt_ti1.
+
 config TOUCHSCREEN_LPC32XX
 	tristate "LPC32XX touchscreen controller"
 	depends on ARCH_LPC32XX
