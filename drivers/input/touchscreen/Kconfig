@@ -365,6 +365,16 @@ config TOUCHSCREEN_LNT_TI1
 	  To compile this driver as a module, choose M here: the
 	  module will be called lnt_ti1.
 
+config TOUCHSCREEN_LNT_TI1_I2C
+	tristate "support I2C bus connection"
+	depends on TOUCHSCREEN_LNT_TI1 && I2C
+	help
+	  Say Y here if you have the LNT Touchinterface 1 controller
+	  connected to an I2C bus.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called lnt_ti1_i2c.
+
 config TOUCHSCREEN_LNT_TI1_SERIO
 	tristate "support serio (UART) connection"
 	depends on TOUCHSCREEN_LNT_TI1 && SERIO

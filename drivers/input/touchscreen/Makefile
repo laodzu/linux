@@ -38,6 +38,7 @@ obj-$(CONFIG_TOUCHSCREEN_ILI210X)	+= ili210x.o
 obj-$(CONFIG_TOUCHSCREEN_INEXIO)	+= inexio.o
 obj-$(CONFIG_TOUCHSCREEN_INTEL_MID)	+= intel-mid-touch.o
 obj-$(CONFIG_TOUCHSCREEN_LNT_TI1)	+= lnt_ti1.o
+obj-$(CONFIG_TOUCHSCREEN_LNT_TI1_I2C)	+= lnt_ti1_i2c.o
 obj-$(CONFIG_TOUCHSCREEN_LNT_TI1_SERIO)	+= lnt_ti1_serio.o
 obj-$(CONFIG_TOUCHSCREEN_LNT_TI1_SPI)	+= lnt_ti1_spi.o
 obj-$(CONFIG_TOUCHSCREEN_LPC32XX)	+= lpc32xx_ts.o
