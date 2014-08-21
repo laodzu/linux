@@ -1,0 +1,56 @@
+* LNT Automation GmbH Touchinterface 1 (LNT-TI1)
+
+The "Touchinterface 1" made by LNT Automation GmbH can communicate by
+means of several physical transports:  I2C, SPI, UART.  In all these
+versions a GPIO line signals the availability of touch data.
+
+In addition to the standard properties for I2C slaves, SPI slaves, and
+UART connected serio devices, the properties discussed below are
+specific to the LNT TI1.  The GPIO specification uses the standard
+binding to reference GPIO lines on a GPIO controller.  The interrupt
+specification uses the standard binding to reference IRQ lines of an IRQ
+controller.
+
+See the other bindings for details on common properties:
+[0]: bindings/gpio/gpio.txt
+[1]: bindings/interrupt-controller/interrupts.txt
+[2]: bindings/spi/spi-bus.txt
+
+
+Required properties:
+- compatible: must contain one of "lnt,ti1-i2c", "lnt,ti1-serio", or
+  "lnt,ti1-spi"
+- gpios: one phandle and GPIO specifier pair, identifying the "CHG"
+  (change) signal of the touch controller
+
+Optional properties:
+- interrupts: identifies an IRQ source if the GPIO controller is not
+  capable of serving as an IRQ controller; if present this property
+  takes precedence over the 'gpios' derived IRQ specification, in the
+  absence of this property the IRQ source gets determined from the GPIO
+  specification
+
+Depending on the software implementation, alternative forms of identifying
+the IRQ source might be supported.  See the 'interrupts-extended' property
+in the common interrupt binding for an example.
+
+
+Examples:
+
+	touchscreen@8 {
+		compatible = "lnt,ti1-i2c";
+		reg = <0x08>;			/* I2C slave addr */
+		gpios = <&gpio1 28 0>;		/* pen down */
+	};
+
+	touchscreen@4 {
+		compatible = "lnt,ti1-spi";
+		reg = <4>;			/* SPI chip select */
+		spi-max-frequency = <4500000>;
+		gpios = <&gpio2 24 0>;		/* pen down */
+	};
+
+	touchscreen {
+		compatible = "lnt,ti1-serio";
+		gpios = <&gpio1 0 0>;		/* pen down */
+	};
