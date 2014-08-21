@@ -51,6 +51,7 @@ isl	Intersil
 karo	Ka-Ro electronics GmbH
 lg	LG Corporation
 linux	Linux-specific binding
+lnt	LNT Automation GmbH
 lsi	LSI Corp. (LSI Logic)
 marvell	Marvell Technology Group Ltd.
 maxim	Maxim Integrated Products
