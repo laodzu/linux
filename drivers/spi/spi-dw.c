@@ -737,8 +737,7 @@ static int dw_spi_setup(struct spi_device *spi)
 				      spi->mode & SPI_CS_HIGH ? 0 : 1);
 	}
 	if (!chip) {
-		chip = devm_kzalloc(&spi->dev, sizeof(struct chip_data),
-				GFP_KERNEL);
+		chip = kzalloc(sizeof(struct chip_data), GFP_KERNEL);
 		if (!chip)
 			return -ENOMEM;
 		spi_set_ctldata(spi, chip);
@@ -793,8 +792,11 @@ static int dw_spi_setup(struct spi_device *spi)
 
 static void dw_spi_cleanup(struct spi_device *spi)
 {
-	struct chip_data *chip = spi_get_ctldata(spi);
+	struct chip_data *chip;
+
+	chip = spi_get_ctldata(spi);
 	kfree(chip);
+	spi_set_ctldata(spi, NULL);
 
 	if (gpio_is_valid(spi->cs_gpio))
 		gpio_free(spi->cs_gpio);
