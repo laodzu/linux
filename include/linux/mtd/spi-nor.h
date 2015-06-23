@@ -167,7 +167,7 @@ struct spi_nor {
 	u8			read_opcode;
 	u8			read_dummy;
 	u8			program_opcode;
-	u32			jedec_id;
+	struct flash_info	*flash_info;
 
 	enum read_mode		flash_read;
 	bool			sst_write_second;

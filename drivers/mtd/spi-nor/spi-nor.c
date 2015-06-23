@@ -168,6 +168,8 @@ static inline struct spi_nor *mtd_to_spi_nor(struct mtd_info *mtd)
 	return mtd->priv;
 }
 
+static void spi_nor_shutdown(struct spi_nor *nor);
+
 /* Enable/disable 4-byte addressing mode. */
 static inline int set_4byte(struct spi_nor *nor, struct flash_info *info,
 			    int enable)
@@ -175,6 +177,11 @@ static inline int set_4byte(struct spi_nor *nor, struct flash_info *info,
 	int status;
 	bool need_wren = false;
 	u8 cmd;
+
+	if (enable)
+		nor->shutdown = spi_nor_shutdown;
+	else
+		nor->shutdown = NULL;
 
 	switch (JEDEC_MFR(info)) {
 	case CFI_MFR_ST: /* Micron, actually */
@@ -197,6 +204,12 @@ static inline int set_4byte(struct spi_nor *nor, struct flash_info *info,
 		return nor->write_reg(nor, SPINOR_OP_BRWR, nor->cmd_buf, 1, 0);
 	}
 }
+
+static void spi_nor_shutdown(struct spi_nor *nor)
+{
+	set_4byte(nor, nor->flash_info, 0);
+}
+
 static inline int spi_nor_sr_ready(struct spi_nor *nor)
 {
 	int sr = read_sr(nor);
@@ -928,9 +941,6 @@ static int micron_quad_enable(struct spi_nor *nor)
 		return -EINVAL;
 	}
 
-	if (!nor->shutdown)
-		nor->shutdown = spi_nor_shutdown;
-
 	return 0;
 }
 
@@ -961,11 +971,6 @@ static int set_quad_mode(struct spi_nor *nor, struct flash_info *info)
 		}
 		return status;
 	}
-}
-
-static void spi_nor_shutdown(struct spi_nor *nor)
-{
-	set_4byte(nor, nor->jedec_id, 0);
 }
 
 static int spi_nor_check(struct spi_nor *nor)
@@ -1030,7 +1035,7 @@ int spi_nor_scan(struct spi_nor *nor, const char *name, enum read_mode mode)
 
 	mutex_init(&nor->lock);
 
-	nor->jedec_id = info->jedec_id;
+	nor->flash_info = info;
 
 	/*
 	 * Atmel, SST and Intel/Numonyx serial nor tend to power

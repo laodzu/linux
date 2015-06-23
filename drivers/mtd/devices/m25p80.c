@@ -252,7 +252,10 @@ static int m25p_remove(struct spi_device *spi)
 static void m25p_shutdown(struct spi_device *spi)
 {
 	struct m25p	*flash = spi_get_drvdata(spi);
-	flash->spi_nor.shutdown(&flash->spi_nor);
+	if (flash->spi_nor.shutdown) {
+		dev_warn(&spi->dev, "resetting chip to 3 byte adressing\n");
+		flash->spi_nor.shutdown(&flash->spi_nor);
+	}
 }
 
 /*
