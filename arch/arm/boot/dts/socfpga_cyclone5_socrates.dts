@@ -30,6 +30,91 @@
 		device_type = "memory";
 		reg = <0x0 0x40000000>; /* 1GB */
 	};
+
+	soc {
+		uio-gpio@ff2000000 {
+			compatible = "generic-uio";
+			reg = <0xff200000 0x1000>;
+		};
+
+		framebuffer {
+			compatible = "simple-framebuffer";
+			reg = <0x3f000000 (800 * 480 * 4)>;
+			width = <800>;
+			height = <480>;
+			stride = <(800 * 4)>;
+			format = "a8r8g8b8";
+			status = "disabled";
+		};
+
+	        leds {
+			compatible = "gpio-leds";
+
+			hps0 {
+				label = "hps_led0";
+				gpios = <&porta 28 1>;
+			};
+
+			hps1 {
+				label = "hps_led1";
+				gpios = <&portb 19 1>;
+			};
+
+			hps2 {
+				label = "hps_led2";
+				gpios = <&portb 25 1>;
+			};
+		};
+
+		keys {
+			compatible = "gpio-keys";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			poll-interval = <100>;
+
+			up {
+				label = "joystick up";
+				linux,code = <0x67>;
+				gpios = <&portc 19 0>;
+			};
+
+			down {
+				label = "joystick down";
+				linux,code = <0x6a>;
+				gpios = <&portc 20 0>;
+			};
+
+			left {
+				label = "joystick left";
+				linux,code = <0x69>;
+				gpios = <&portc 24 0>;
+			};
+
+			right {
+				label = "joystick right";
+				linux,code = <0x6c>;
+				gpios = <&portc 23 0>;
+			};
+
+			button {
+				label = "joystick button";
+				linux,code = <0x1c>;
+				gpios = <&portc 15 0>;
+			};
+		};
+	};
+};
+
+&gpio0 {
+       status = "okay";
+};
+
+&gpio1 {
+       status = "okay";
+};
+
+&gpio2 {
+       status = "okay";
 };
 
 &gmac1 {
@@ -47,4 +132,55 @@
 
 &mmc {
 	status = "okay";
+};
+
+&qspi {
+	status = "okay";
+
+	flash0: n25q256a@0 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "n25q256a";
+		reg = <0>;      /* chip select */
+		spi-max-frequency = <100000000>;
+		m25p,fast-read;
+
+		page-size = <256>;
+		block-size = <16>;
+		read-delay = <4>;
+		tshsl-ns = <50>;
+		tsd2d-ns = <50>;
+		tchsh-ns = <4>;
+		tslch-ns = <4>;
+
+		partition@preloader {
+			label = "preloader";
+			reg = <0x0 0x40000>;
+		};
+
+		partition@env {
+			label = "env";
+			reg = <0x40000 0x10000>;
+		};
+
+		partition@fdt {
+			label = "fdt";
+			reg = <0x50000 0x10000>;
+		};
+
+		partition@uboot {
+			label = "U-Boot";
+			reg = <0x60000 0xa0000>;
+		};
+
+		partition@kernel {
+			label = "kernel";
+			reg = <0xa0000 0x600000>;
+		};
+
+		partition@user {
+			label = "user";
+			reg = <0x6a0000 0x1960000>;
+		};
+	};
 };
