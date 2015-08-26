@@ -192,3 +192,7 @@
 &usb1 {
         status = "okay";
 };
+
+&can0 {
+        status = "okay";
+};
