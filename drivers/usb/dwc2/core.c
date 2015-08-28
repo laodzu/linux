@@ -413,19 +413,25 @@ int dwc2_core_init(struct dwc2_hsotg *hsotg, bool select_phy, int irq)
 
 	/* Set ULPI External VBUS bit if needed */
 	usbcfg &= ~GUSBCFG_ULPI_EXT_VBUS_DRV;
+#if 0
 	if (hsotg->core_params->phy_ulpi_ext_vbus ==
 				DWC2_PHY_ULPI_EXTERNAL_VBUS)
 		usbcfg |= GUSBCFG_ULPI_EXT_VBUS_DRV;
+#else
+	usbcfg |= GUSBCFG_ULPI_EXT_VBUS_DRV;
+#endif
 
 	/* Set external TS Dline pulsing bit if needed */
 	usbcfg &= ~GUSBCFG_TERMSELDLPULSE;
 	if (hsotg->core_params->ts_dline > 0)
 		usbcfg |= GUSBCFG_TERMSELDLPULSE;
 
+#if 0
 	/* Set external VBUS indicator as needed. */
 	if (hsotg->core_params->phy_type == DWC2_PHY_TYPE_PARAM_ULPI)
 		usbcfg |= (GUSBCFG_ULPI_INT_VBUS_IND |
 				GUSBCFG_INDICATORPASSTHROUGH);
+#endif
 
 	writel(usbcfg, hsotg->regs + GUSBCFG);
 
