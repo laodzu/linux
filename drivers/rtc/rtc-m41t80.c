@@ -121,6 +121,10 @@ static int m41t80_get_datetime(struct i2c_client *client,
 
 	/* assume 20YY not 19YY, and ignore the Century Bit */
 	tm->tm_year = bcd2bin(buf[M41T80_REG_YEAR]) + 100;
+
+	/* HACK: prevent overflow of 32 bit timer system */
+	if (tm->tm_year > 138)
+		tm->tm_year = 100;
 	return rtc_valid_tm(tm);
 }
 
@@ -174,8 +178,12 @@ static int m41t80_set_datetime(struct i2c_client *client, struct rtc_time *tm)
 		bin2bcd(tm->tm_mday) | (buf[M41T80_REG_DAY] & ~0x3f);
 	buf[M41T80_REG_MON] =
 		bin2bcd(tm->tm_mon + 1) | (buf[M41T80_REG_MON] & ~0x1f);
-	/* assume 20YY not 19YY */
-	buf[M41T80_REG_YEAR] = bin2bcd(tm->tm_year % 100);
+	/* Truncate pre-2000 to 2k */
+	if (tm->tm_year < 100)
+		buf[M41T80_REG_YEAR] = 0;
+	else
+		/* assume 20YY not 19YY */
+		buf[M41T80_REG_YEAR] = bin2bcd(tm->tm_year % 100);
 
 	if (i2c_transfer(client->adapter, msgs, 1) != 1) {
 		dev_err(&client->dev, "write error\n");
