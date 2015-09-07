@@ -147,6 +147,7 @@ static int socfpga_is_a10(void)
 
 static void __init socfpga_map_io(void)
 {
+	debug_ll_io_init();
 	socfpga_scu_map_io();
 	early_printk("Early printk initialized\n");
 }
