@@ -36,6 +36,14 @@
 	};
 
 	soc {
+		aclsoc_drv {
+			compatible = "altr,aclsoc_drv";
+			interrupt-parent = <&intc>;
+			interrupts = <0 40 4>;
+			status = "disabled";
+		};
+
+
 		uio-gpio@ff2000000 {
 			compatible = "generic-uio";
 			reg = <0xff200000 0x1000>;
