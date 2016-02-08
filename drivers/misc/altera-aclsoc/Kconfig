@@ -1,0 +1,7 @@
+comment "Altera aclsoc driver module"
+
+config ALTERA_ACLSOC
+	tristate "Altera aclsoc driver module"
+	default n
+	help
+	  Support OpenCL applications on SoCFPGA systems from Altera.
