@@ -60,14 +60,10 @@ MODULE_SUPPORTED_DEVICE ("Altera OpenCL SoC Devices");
 #define   HPS2FPGA_OFFSET   0xC0000000 
 #define   HPS2FPGA_SIZE     0x10000   // Global memory window size
 
-// FPGA_IRQ0 interrupt is at 72.
-#define PIO_IRQ (72)
-
-
 /* Static function declarations */
-static int __init aclsoc_probe(void);
+static int aclsoc_probe(struct platform_device *pdev);
 static int __init init_chrdev (struct aclsoc_dev *aclsoc);
-static void __exit aclsoc_remove(void);
+static int __exit aclsoc_remove(struct platform_device *pdev);
 static int aclsoc_mmap (struct file *filp, struct vm_area_struct *vma);
 
 static struct aclsoc_dev *aclsoc = 0;
@@ -85,6 +81,22 @@ static struct platform_driver aclsoc_driver = {
   .remove = NULL, // FPGA is always there. So no probe/remove
 };
 */
+
+static struct of_device_id aclsoc_drv_dt_ids[] = {
+	{
+		.compatible = "altr,aclsoc_drv"
+	}, { /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, aclsoc_drv_dt_ids);
+
+static struct platform_driver aclsoc_driver = {
+	.probe = aclsoc_probe,
+	.remove = aclsoc_remove,
+	.driver = {
+		.name ="aclsoc_drv",
+		.of_match_table = aclsoc_drv_dt_ids,
+	},
+};
 
 struct file_operations aclsoc_fileops = {
   .owner =    THIS_MODULE,
@@ -289,12 +301,12 @@ int init_irq (struct aclsoc_dev *aclsoc) {
   /* Using non-shared MSI interrupts.*/
   irq_type = 0;
   
-  rc = request_irq (PIO_IRQ, aclsoc_irq, irq_type, DRIVER_NAME, (void*)aclsoc);
+  rc = request_irq (aclsoc->irq, aclsoc_irq, irq_type, DRIVER_NAME, (void*)aclsoc);
   if (rc) {
-    ACL_DEBUG (KERN_DEBUG "Could not request IRQ #%d, error %d", PIO_IRQ, rc);
+    ACL_DEBUG (KERN_DEBUG "Could not request IRQ #%d, error %d", aclsoc->irq, rc);
     return -1;
   }
-  ACL_DEBUG (KERN_DEBUG "Succesfully requested IRQ #%d", PIO_IRQ);
+  ACL_DEBUG (KERN_DEBUG "Succesfully requested IRQ #%d", aclsoc->irq);
   
   aclsoc->num_handled_interrupts = 0;
   aclsoc->num_undelivered_signals = 0;
@@ -325,8 +337,8 @@ void release_irq (struct aclsoc_dev *aclsoc) {
    * the whole system. */
   mask_irq(aclsoc);
   
-  ACL_VERBOSE_DEBUG (KERN_DEBUG "Freeing IRQ %d", PIO_IRQ);
-  free_irq (PIO_IRQ, (void*)aclsoc);
+  ACL_VERBOSE_DEBUG (KERN_DEBUG "Freeing IRQ %d", aclsoc->irq);
+  free_irq (aclsoc->irq, (void*)aclsoc);
   
   ACL_VERBOSE_DEBUG (KERN_DEBUG "Handled %d interrupts", 
         aclsoc->num_handled_interrupts);
@@ -456,9 +468,10 @@ void free_contiguous_memory(struct aclsoc_dev *aclsoc) {
 }
 
 
-static int __init aclsoc_probe(void) {
+static int aclsoc_probe(struct platform_device *pdev) {
 
   int res, i;
+
   ACL_VERBOSE_DEBUG (KERN_DEBUG " probe");
 
   // That's static aclsoc -- this driver is only for one instance of the device!  
@@ -484,6 +497,8 @@ static int __init aclsoc_probe(void) {
   if (res) {
     goto fail_chrdev_init;
   }
+
+  aclsoc->irq = platform_get_irq(pdev, 0);
 
   // region 0 for global memory, region 2 for control, just like BARs for 
   // PCIe devices. Makes acl_init.c simpler.
@@ -525,11 +540,11 @@ fail_kzalloc:
 }
 
 
-static void __exit aclsoc_remove(void) {
+static int __exit aclsoc_remove(struct platform_device *pdev) {
 
   ACL_DEBUG (KERN_DEBUG ": aclsoc is %p", aclsoc);
   if (aclsoc == NULL) {
-    return;
+    return 0;
   }
   
   #if !POLLING
@@ -551,6 +566,8 @@ static void __exit aclsoc_remove(void) {
   
   kfree (aclsoc);
   aclsoc = 0;
+
+  return 0;
 }
 
 
@@ -560,14 +577,17 @@ static int __init aclsoc_init(void) {
 
   ACL_DEBUG (KERN_DEBUG "----------------------------");
   ACL_DEBUG (KERN_DEBUG "Driver version: %s", ACL_DRIVER_VERSION);
-  aclsoc_probe();
+
+  if (platform_driver_register(&aclsoc_driver)) {
+    printk(KERN_ERR "hello: cannot register platform driver\n");
+  }
+
   return 0; // platform_driver_register (&aclsoc_driver);
 }
 
 static void __exit aclsoc_exit(void)
 {
-//  platform_driver_unregister(&aclsoc_driver);
-  aclsoc_remove();
+  platform_driver_unregister(&aclsoc_driver);
   printk(KERN_DEBUG "aclsoc driver is unloaded!\n");
 }
 

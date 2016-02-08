@@ -145,7 +145,9 @@ struct aclsoc_dev {
     
   /* Controls which section of board's DDR maps to BAR */
   u64 global_mem_segment;
-  
+
+  /* IRQ not a physical number but a kernel allocated dynamic entity */
+  int irq;
   /* Kernel irq - mustn't assume it's safe to enable kernel irq */
   char saved_kernel_irq_mask;
   
