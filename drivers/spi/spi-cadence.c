@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/of_irq.h>
 #include <linux/of_address.h>
+#include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/spi/spi.h>
@@ -466,7 +467,7 @@ static int cdns_unprepare_transfer_hardware(struct spi_master *master)
  */
 static int cdns_spi_probe(struct platform_device *pdev)
 {
-	int ret = 0, irq;
+	int ret = 0, irq, i;
 	struct spi_master *master;
 	struct cdns_spi *xspi;
 	struct resource *res;
@@ -528,6 +529,31 @@ static int cdns_spi_probe(struct platform_device *pdev)
 				   &xspi->is_decoded_cs);
 	if (ret < 0)
 		xspi->is_decoded_cs = 0;
+
+	for (i = 0; i < num_cs; i++) {
+		int cs_gpio = of_get_named_gpio(pdev->dev.of_node,
+						"cs-gpios", i);
+
+		if (cs_gpio == -EPROBE_DEFER) {
+			ret = cs_gpio;
+			goto clk_dis_all;
+		}
+
+		if (gpio_is_valid(cs_gpio)) {
+			if (devm_gpio_request(&pdev->dev, cs_gpio,
+					      dev_name(&pdev->dev))) {
+				dev_err(&pdev->dev, "could not request %d gpio\n",
+					cs_gpio);
+				goto clk_dis_all;
+			}
+
+			if (gpio_direction_output(cs_gpio, 1)) {
+				dev_err(&pdev->dev, "could not set gpio %d as output\n",
+					cs_gpio);
+				goto clk_dis_all;
+			}
+		}
+	}
 
 	/* SPI controller initializations */
 	cdns_spi_init_hw(xspi);
