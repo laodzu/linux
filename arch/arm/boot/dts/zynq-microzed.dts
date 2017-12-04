@@ -110,3 +110,11 @@
 	dr_mode = "host";
 	usb-phy = <&usb_phy0>;
 };
+
+&i2c0 {
+	status = "disabled";
+	pmod@40 {
+		compatible = "htu21";
+		reg = <0x40>;
+	};
+};
