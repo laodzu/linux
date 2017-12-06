@@ -118,3 +118,14 @@
 		reg = <0x40>;
 	};
 };
+
+&amba {
+	ps_leds {
+		compatible = "gpio-leds";
+		ps_led0 {
+			label = "ps_led0";
+			gpios = <&gpio0 47 0>;
+			linux,default-trigger = "mmc0";
+		};
+	};
+};
