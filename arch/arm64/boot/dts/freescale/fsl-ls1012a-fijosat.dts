@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Device Tree file for Freescale LS1012A RDB Board.
+ *
+ * Copyright 2016 Freescale Semiconductor, Inc.
+ *
+ */
+/dts-v1/;
+
+#include "fsl-ls1012a.dtsi"
+
+/ {
+	model = "LS1012A RDB Board";
+	compatible = "fsl,ls1012a-rdb", "fsl,ls1012a";
+
+	aliases {
+		ethernet0 = &pfe_mac0;
+	};
+};
+
+&pcie {
+	status = "okay";
+};
+
+&duart0 {
+	status = "okay";
+};
+
+&esdhc0 {
+	sd-uhs-sdr104;
+	sd-uhs-sdr50;
+	sd-uhs-sdr25;
+	sd-uhs-sdr12;
+	status = "okay";
+};
+
+&esdhc1 {
+	mmc-hs200-1_8v;
+	status = "disabled";
+};
+
+&i2c0 {
+	status = "okay";
+};
+
+&sata {
+	status = "okay";
+};
+
+&pfe {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	pfe_mac0: ethernet@0 {
+		compatible = "fsl,pfe-gemac-port";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg = <0x0>;    /* GEM_ID */
+		fsl,mdio-mux-val = <0x0>;
+		phy-mode = "sgmii";
+		fixed-link {
+			speed=<1000>;
+			full-duplex;
+		};
+	};
+};
+
+&qspi {
+	status = "okay";
+	qflash0: s25fs512s@0 {
+		compatible = "spansion,m25p80";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		spi-max-frequency = <20000000>;
+		m25p,fast-read;
+		reg = <0>;
+		spi-rx-bus-width = <2>;
+		spi-tx-bus-width = <2>;
+	};
+
+};
+
+
+&dspi {
+	status="okay";
+	id = <1>;
+	bus-num = <1>;
+	ksz9897@0 {
+		status="okay";
+		compatible = "microchip,ksz9897";
+		reg = <0>;
+		vcc-supply = < 0x06 >;
+		spi-max-frequency = <44000000>;
+		spi-cpha;
+		spi-cpol;
+		big-endian;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			swport1:port@0 {
+				reg = <0>;
+				label = "lan1";
+				//local-mac-address = [38 B7 4D 00 74 C1];
+			};
+			port@1 {
+				reg = <1>;
+				label = "lan2";
+				//local-mac-address = [38 B7 4D 00 74 C2];
+			};
+			port@2 {
+				reg = <2>;
+				label = "lan3";
+				//local-mac-address = [38 B7 4D 00 74 C3];
+			};
+			port@3 {
+				reg = <3>;
+				label = "lan4";
+				//local-mac-address = [38 B7 4D 00 74 C4];
+			};
+			port@4 {
+				reg = <4>;
+				label = "lan5";
+				//local-mac-address = [38 B7 4D 00 74 C5];
+			};
+			port@5 {
+				reg = <5>;
+				label = "rgmii-port";
+				//local-mac-address = [38 B7 4D 00 74 C6];
+			};
+			port@6 {
+				reg = <6>;
+				label = "cpu";
+				ethernet=<&pfe>;
+				phy-mode = "sgmii";
+				fixed-link {
+					speed=<1000>;
+					full-duplex;
+				};
+			};
+		};
+	};
+};
