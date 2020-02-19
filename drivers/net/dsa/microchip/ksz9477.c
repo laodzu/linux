@@ -198,6 +198,7 @@ static int ksz9477_reset_switch(struct ksz_device *dev)
 {
 	u8 data8;
 	u32 data32;
+	u32 cnt, reg;
 
 	/* reset switch */
 	ksz_cfg(dev, REG_SW_OPERATION, SW_RESET, true);
@@ -216,6 +217,38 @@ static int ksz9477_reset_switch(struct ksz_device *dev)
 	ksz_write32(dev, REG_SW_INT_MASK__4, SWITCH_INT_MASK);
 	ksz_write32(dev, REG_SW_PORT_INT_MASK__4, 0x7F);
 	ksz_read32(dev, REG_SW_PORT_INT_STATUS__4, &data32);
+
+	/* dzu */
+	/* Erratum #7 - SGMI auto-negotiation does not set bit 0 in the autoneg code word */
+	ksz_pwrite32(dev, 6, REG_PORT_SGMII_ADDR__4, 0x1F0004);
+	ksz_pwrite32(dev, 6, REG_PORT_SGMII_DATA__4, 0x01a0);
+	/* Enable PHY Mode, SGMII Mode, SGMII Link status */
+	ksz_pwrite32(dev, 6, REG_PORT_SGMII_ADDR__4, 0x1F8001);
+	ksz_pwrite32(dev, 6, REG_PORT_SGMII_DATA__4, 0x1c);
+	/* Restart autonegotiation */
+	ksz_pwrite32(dev, 6, REG_PORT_SGMII_ADDR__4, 0x1F0000);
+	ksz_pwrite32(dev, 6, REG_PORT_SGMII_DATA__4, 0x1340);
+	/* Wait until autoneg finished */
+	reg = 0x1F0001;
+	for (cnt = 0; cnt < 1024; cnt++) {
+	  ksz_pwrite32(dev, 6, REG_PORT_SGMII_ADDR__4, reg);
+	  ksz_pread32(dev, 6, REG_PORT_SGMII_DATA__4, &data32);
+	  if (data32 & 0x20) {
+	    dev_printk(KERN_INFO, dev->dev, "dzu autoneg finished");
+	    dev_printk(KERN_INFO, dev->dev, "dzu port 6 reg %06x = %08x", reg, data32);
+	    break;
+	  }
+	}
+	for (reg = 0x1F0000; reg < 0x1F0007; reg++) {
+	  ksz_pwrite32(dev, 6, REG_PORT_SGMII_ADDR__4, reg);
+	  ksz_pread32(dev, 6, REG_PORT_SGMII_DATA__4, &data32);
+	  dev_printk(KERN_INFO, dev->dev, "dzu port 6 reg %06x = %08x", reg, data32);
+	}
+	for (reg = 0x1F8000; reg < 0x1F8003; reg++) {
+	  ksz_pwrite32(dev, 6, REG_PORT_SGMII_ADDR__4, reg);
+	  ksz_pread32(dev, 6, REG_PORT_SGMII_DATA__4, &data32);
+	  dev_printk(KERN_INFO, dev->dev, "dzu port 6 reg %06x = %08x", reg, data32);
+	}
 
 	/* set broadcast storm protection 10% rate */
 	regmap_update_bits(dev->regmap[1], REG_SW_MAC_CTRL_2,
