@@ -1,13 +1,20 @@
 /* SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause) */
 /*
  * Copyright (C) 2014-2016 Freescale Semiconductor, Inc.
- * Copyright 2016 NXP
+ * Copyright 2016-2019 NXP
  *
  */
 #ifndef __FSL_QBMAN_PORTAL_H
 #define __FSL_QBMAN_PORTAL_H
 
 #include <soc/fsl/dpaa2-fd.h>
+
+#define QMAN_REV_4000   0x04000000
+#define QMAN_REV_4100   0x04010000
+#define QMAN_REV_4101   0x04010001
+#define QMAN_REV_5000   0x05000000
+
+#define QMAN_REV_MASK   0xffff0000
 
 struct dpaa2_dq;
 struct qbman_swp;
@@ -110,6 +117,11 @@ struct qbman_swp {
 		u32 valid_bit; /* 0x00 or 0x80 */
 	} mc;
 
+	/* Management response */
+	struct {
+		u32 valid_bit; /* 0x00 or 0x80 */
+	} mr;
+
 	/* Push dequeues */
 	u32 sdq;
 
@@ -162,6 +174,9 @@ int qbman_result_has_new_result(struct qbman_swp *p, const struct dpaa2_dq *dq);
 
 void qbman_eq_desc_clear(struct qbman_eq_desc *d);
 void qbman_eq_desc_set_no_orp(struct qbman_eq_desc *d, int respond_success);
+void qbman_eq_desc_set_orp(struct qbman_eq_desc *d, int respond_success,
+			   u16 oprid, u16 seqnum, int incomplete);
+void qbman_eq_desc_set_orp_hole(struct qbman_eq_desc *d, u16 oprid, u16 seqnum);
 void qbman_eq_desc_set_token(struct qbman_eq_desc *d, u8 token);
 void qbman_eq_desc_set_fq(struct qbman_eq_desc *d, u32 fqid);
 void qbman_eq_desc_set_qd(struct qbman_eq_desc *d, u32 qdid,
@@ -169,6 +184,8 @@ void qbman_eq_desc_set_qd(struct qbman_eq_desc *d, u32 qdid,
 
 int qbman_swp_enqueue(struct qbman_swp *p, const struct qbman_eq_desc *d,
 		      const struct dpaa2_fd *fd);
+
+int qbman_orp_drop(struct qbman_swp *s, u16 orpid, u16 seqnum);
 
 void qbman_release_desc_clear(struct qbman_release_desc *d);
 void qbman_release_desc_set_bpid(struct qbman_release_desc *d, u16 bpid);
@@ -428,7 +445,7 @@ static inline int qbman_swp_CDAN_set_context_enable(struct qbman_swp *s,
 static inline void *qbman_swp_mc_complete(struct qbman_swp *swp, void *cmd,
 					  u8 cmd_verb)
 {
-	int loopvar = 1000;
+	int loopvar = 2000;
 
 	qbman_swp_mc_submit(swp, cmd, cmd_verb);
 

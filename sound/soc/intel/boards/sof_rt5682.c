@@ -10,8 +10,6 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/dmi.h>
-#include <asm/cpu_device_id.h>
-#include <asm/intel-family.h>
 #include <sound/core.h>
 #include <sound/jack.h>
 #include <sound/pcm.h>
@@ -21,6 +19,7 @@
 #include <sound/soc-acpi.h>
 #include "../../codecs/rt5682.h"
 #include "../../codecs/hdac_hdmi.h"
+#include "../common/soc-intel-quirks.h"
 
 #define NAME_SIZE 32
 
@@ -29,9 +28,10 @@
 #define SOF_RT5682_MCLK_EN			BIT(3)
 #define SOF_RT5682_MCLK_24MHZ			BIT(4)
 #define SOF_SPEAKER_AMP_PRESENT		BIT(5)
-#define SOF_RT5682_SSP_AMP(quirk)		((quirk) & GENMASK(8, 6))
-#define SOF_RT5682_SSP_AMP_MASK			(GENMASK(8, 6))
 #define SOF_RT5682_SSP_AMP_SHIFT		6
+#define SOF_RT5682_SSP_AMP_MASK                 (GENMASK(8, 6))
+#define SOF_RT5682_SSP_AMP(quirk)	\
+	(((quirk) << SOF_RT5682_SSP_AMP_SHIFT) & SOF_RT5682_SSP_AMP_MASK)
 
 /* Default: MCLK on, MCLK 19.2M, SSP0  */
 static unsigned long sof_rt5682_quirk = SOF_RT5682_MCLK_EN |
@@ -144,9 +144,9 @@ static int sof_rt5682_codec_init(struct snd_soc_pcm_runtime *rtd)
 	jack = &ctx->sof_headset;
 
 	snd_jack_set_key(jack->jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
-	snd_jack_set_key(jack->jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
-	snd_jack_set_key(jack->jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
-	snd_jack_set_key(jack->jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
+	snd_jack_set_key(jack->jack, SND_JACK_BTN_1, KEY_VOICECOMMAND);
+	snd_jack_set_key(jack->jack, SND_JACK_BTN_2, KEY_VOLUMEUP);
+	snd_jack_set_key(jack->jack, SND_JACK_BTN_3, KEY_VOLUMEDOWN);
 	ret = snd_soc_component_set_jack(component, jack, NULL);
 
 	if (ret) {
@@ -303,12 +303,6 @@ static struct snd_soc_card sof_audio_card_rt5682 = {
 	.late_probe = sof_card_late_probe,
 };
 
-static const struct x86_cpu_id legacy_cpi_ids[] = {
-	{ X86_VENDOR_INTEL, 6, INTEL_FAM6_ATOM_SILVERMONT }, /* Baytrail */
-	{ X86_VENDOR_INTEL, 6, INTEL_FAM6_ATOM_AIRMONT }, /* Cherrytrail */
-	{}
-};
-
 static struct snd_soc_dai_link_component rt5682_component[] = {
 	{
 		.name = "i2c-10EC5682:00",
@@ -337,12 +331,15 @@ static struct snd_soc_dai_link *sof_card_dai_links_create(struct device *dev,
 							  int hdmi_num)
 {
 	struct snd_soc_dai_link_component *idisp_components;
+	struct snd_soc_dai_link_component *cpus;
 	struct snd_soc_dai_link *links;
 	int i, id = 0;
 
 	links = devm_kzalloc(dev, sizeof(struct snd_soc_dai_link) *
 			     sof_audio_card_rt5682.num_links, GFP_KERNEL);
-	if (!links)
+	cpus = devm_kzalloc(dev, sizeof(struct snd_soc_dai_link_component) *
+			     sof_audio_card_rt5682.num_links, GFP_KERNEL);
+	if (!links || !cpus)
 		goto devm_err;
 
 	/* codec SSP */
@@ -362,11 +359,13 @@ static struct snd_soc_dai_link *sof_card_dai_links_create(struct device *dev,
 	links[id].dpcm_playback = 1;
 	links[id].dpcm_capture = 1;
 	links[id].no_pcm = 1;
+	links[id].cpus = &cpus[id];
+	links[id].num_cpus = 1;
 	if (is_legacy_cpu) {
-		links[id].cpu_dai_name = devm_kasprintf(dev, GFP_KERNEL,
-							"ssp%d-port",
-							ssp_codec);
-		if (!links[id].cpu_dai_name)
+		links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
+							  "ssp%d-port",
+							  ssp_codec);
+		if (!links[id].cpus->dai_name)
 			goto devm_err;
 	} else {
 		/*
@@ -379,10 +378,10 @@ static struct snd_soc_dai_link *sof_card_dai_links_create(struct device *dev,
 		 * It can be removed once we can control MCLK by driver.
 		 */
 		links[id].ignore_pmdown_time = 1;
-		links[id].cpu_dai_name = devm_kasprintf(dev, GFP_KERNEL,
-							"SSP%d Pin",
-							ssp_codec);
-		if (!links[id].cpu_dai_name)
+		links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
+							  "SSP%d Pin",
+							  ssp_codec);
+		if (!links[id].cpus->dai_name)
 			goto devm_err;
 	}
 	id++;
@@ -395,9 +394,11 @@ static struct snd_soc_dai_link *sof_card_dai_links_create(struct device *dev,
 			goto devm_err;
 
 		links[id].id = id;
-		links[id].cpu_dai_name = devm_kasprintf(dev, GFP_KERNEL,
-							"DMIC%02d Pin", i);
-		if (!links[id].cpu_dai_name)
+		links[id].cpus = &cpus[id];
+		links[id].num_cpus = 1;
+		links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
+							  "DMIC%02d Pin", i);
+		if (!links[id].cpus->dai_name)
 			goto devm_err;
 
 		links[id].codecs = dmic_component;
@@ -425,9 +426,11 @@ static struct snd_soc_dai_link *sof_card_dai_links_create(struct device *dev,
 			goto devm_err;
 
 		links[id].id = id;
-		links[id].cpu_dai_name = devm_kasprintf(dev, GFP_KERNEL,
-							"iDisp%d Pin", i);
-		if (!links[id].cpu_dai_name)
+		links[id].cpus = &cpus[id];
+		links[id].num_cpus = 1;
+		links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
+							  "iDisp%d Pin", i);
+		if (!links[id].cpus->dai_name)
 			goto devm_err;
 
 		idisp_components[i - 1].name = "ehdaudio0D2";
@@ -464,18 +467,20 @@ static struct snd_soc_dai_link *sof_card_dai_links_create(struct device *dev,
 		links[id].nonatomic = true;
 		links[id].dpcm_playback = 1;
 		links[id].no_pcm = 1;
+		links[id].cpus = &cpus[id];
+		links[id].num_cpus = 1;
 		if (is_legacy_cpu) {
-			links[id].cpu_dai_name = devm_kasprintf(dev, GFP_KERNEL,
-								"ssp%d-port",
-								ssp_amp);
-			if (!links[id].cpu_dai_name)
+			links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
+								  "ssp%d-port",
+								  ssp_amp);
+			if (!links[id].cpus->dai_name)
 				goto devm_err;
 
 		} else {
-			links[id].cpu_dai_name = devm_kasprintf(dev, GFP_KERNEL,
-								"SSP%d Pin",
-								ssp_amp);
-			if (!links[id].cpu_dai_name)
+			links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
+								  "SSP%d Pin",
+								  ssp_amp);
+			if (!links[id].cpus->dai_name)
 				goto devm_err;
 		}
 	}
@@ -497,7 +502,7 @@ static int sof_audio_probe(struct platform_device *pdev)
 	if (!ctx)
 		return -ENOMEM;
 
-	if (x86_match_cpu(legacy_cpi_ids)) {
+	if (soc_intel_is_byt() || soc_intel_is_cht()) {
 		is_legacy_cpu = 1;
 		dmic_num = 0;
 		hdmi_num = 0;
@@ -519,6 +524,7 @@ static int sof_audio_probe(struct platform_device *pdev)
 
 	/* compute number of dai links */
 	sof_audio_card_rt5682.num_links = 1 + dmic_num + hdmi_num;
+
 	if (sof_rt5682_quirk & SOF_SPEAKER_AMP_PRESENT)
 		sof_audio_card_rt5682.num_links++;
 

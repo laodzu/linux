@@ -281,11 +281,31 @@ static int xhci_plat_probe(struct platform_device *pdev)
 	/* imod_interval is the interrupt moderation value in nanoseconds. */
 	xhci->imod_interval = 40000;
 
+	if (device_property_read_bool(sysdev, "usb3-lpm-capable")) {
+		xhci->quirks |= XHCI_LPM_SUPPORT;
+		if (device_property_read_bool(sysdev,
+					"snps,dis-u1u2-when-u3-quirk"))
+			xhci->quirks |= XHCI_DIS_U1U2_WHEN_U3;
+	}
+
 	/* Iterate over all parent nodes for finding quirks */
 	for (tmpdev = &pdev->dev; tmpdev; tmpdev = tmpdev->parent) {
 
 		if (device_property_read_bool(tmpdev, "usb2-lpm-disable"))
 			xhci->quirks |= XHCI_HW_LPM_DISABLE;
+
+		if (device_property_read_bool(&pdev->dev, "quirk-reverse-in-out"))
+			xhci->quirks |= XHCI_REVERSE_IN_OUT;
+
+		if (device_property_read_bool(&pdev->dev,
+					"quirk-stop-transfer-in-block"))
+			xhci->quirks |= XHCI_STOP_TRANSFER_IN_BLOCK;
+
+		if (device_property_read_bool(&pdev->dev, "quirk-stop-ep-in-u1"))
+			xhci->quirks |= XHCI_STOP_EP_IN_U1;
+
+		if (device_property_read_bool(&pdev->dev, "quirk-broken-port-ped"))
+			xhci->quirks |= XHCI_BROKEN_PORT_PED;
 
 		if (device_property_read_bool(tmpdev, "usb3-lpm-capable"))
 			xhci->quirks |= XHCI_LPM_SUPPORT;

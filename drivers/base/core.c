@@ -1283,6 +1283,34 @@ static ssize_t online_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(online);
 
+static ssize_t suppliers_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct device_link *link;
+	size_t count = 0;
+
+	list_for_each_entry(link, &dev->links.suppliers, c_node)
+		count += scnprintf(buf + count, PAGE_SIZE - count, "%s\n",
+				   dev_name(link->supplier));
+
+	return count;
+}
+static DEVICE_ATTR_RO(suppliers);
+
+static ssize_t consumers_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct device_link *link;
+	size_t count = 0;
+
+	list_for_each_entry(link, &dev->links.consumers, s_node)
+		count += scnprintf(buf + count, PAGE_SIZE - count, "%s\n",
+				   dev_name(link->consumer));
+
+	return count;
+}
+static DEVICE_ATTR_RO(consumers);
+
 int device_add_groups(struct device *dev, const struct attribute_group **groups)
 {
 	return sysfs_create_groups(&dev->kobj, groups);
@@ -1454,8 +1482,20 @@ static int device_add_attrs(struct device *dev)
 			goto err_remove_dev_groups;
 	}
 
+	error = device_create_file(dev, &dev_attr_suppliers);
+	if (error)
+		goto err_remove_online;
+
+	error = device_create_file(dev, &dev_attr_consumers);
+	if (error)
+		goto err_remove_suppliers;
+
 	return 0;
 
+ err_remove_suppliers:
+	device_remove_file(dev, &dev_attr_suppliers);
+ err_remove_online:
+	device_remove_file(dev, &dev_attr_online);
  err_remove_dev_groups:
 	device_remove_groups(dev, dev->groups);
  err_remove_type_groups:
@@ -1473,6 +1513,8 @@ static void device_remove_attrs(struct device *dev)
 	struct class *class = dev->class;
 	const struct device_type *type = dev->type;
 
+	device_remove_file(dev, &dev_attr_consumers);
+	device_remove_file(dev, &dev_attr_suppliers);
 	device_remove_file(dev, &dev_attr_online);
 	device_remove_groups(dev, dev->groups);
 
@@ -2473,6 +2515,34 @@ struct device *device_find_child(struct device *parent, void *data,
 	return child;
 }
 EXPORT_SYMBOL_GPL(device_find_child);
+
+/**
+ * device_find_child_by_name - device iterator for locating a child device.
+ * @parent: parent struct device
+ * @name: name of the child device
+ *
+ * This is similar to the device_find_child() function above, but it
+ * returns a reference to a device that has the name @name.
+ *
+ * NOTE: you will need to drop the reference with put_device() after use.
+ */
+struct device *device_find_child_by_name(struct device *parent,
+					 const char *name)
+{
+	struct klist_iter i;
+	struct device *child;
+
+	if (!parent)
+		return NULL;
+
+	klist_iter_init(&parent->p->klist_children, &i);
+	while ((child = next_device(&i)))
+		if (!strcmp(dev_name(child), name) && get_device(child))
+			break;
+	klist_iter_exit(&i);
+	return child;
+}
+EXPORT_SYMBOL_GPL(device_find_child_by_name);
 
 int __init devices_init(void)
 {

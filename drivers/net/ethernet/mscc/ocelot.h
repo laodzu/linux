@@ -15,13 +15,18 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/ptp_clock_kernel.h>
+#include <linux/net_tstamp.h>
 
 #include "ocelot_ana.h"
 #include "ocelot_dev.h"
+#include "ocelot_ptp.h"
 #include "ocelot_qsys.h"
 #include "ocelot_rew.h"
 #include "ocelot_sys.h"
 #include "ocelot_qs.h"
+#include "ocelot_tc.h"
+#include "ocelot_dev_gmii.h"
 
 #define PGID_AGGR    64
 #define PGID_SRC     80
@@ -32,12 +37,16 @@
 #define PGID_MC      (PGID_AGGR - 3)
 #define PGID_MCIPV4  (PGID_AGGR - 2)
 #define PGID_MCIPV6  (PGID_AGGR - 1)
+#define PGID_MCRED   (PGID_CPU - 20)
 
 #define OCELOT_BUFFER_CELL_SZ 60
 
 #define OCELOT_STATS_CHECK_DELAY (2 * HZ)
 
 #define IFH_LEN 4
+
+/* Length for long prefix header used for frame injection/extraction */
+#define XFH_LONG_PREFIX_LEN 32
 
 struct frame_info {
 	u32 len;
@@ -62,12 +71,18 @@ struct frame_info {
 #define REG_MASK GENMASK(TARGET_OFFSET - 1, 0)
 #define REG(reg, offset) [reg & REG_MASK] = offset
 
+#define REG_RESERVED_ADDR	0xffffffff
+#define REG_RESERVED(reg)	REG(reg, REG_RESERVED_ADDR)
+
 enum ocelot_target {
 	ANA = 1,
+	PTP,
 	QS,
 	QSYS,
 	REW,
 	SYS,
+	S2,
+	GCB,
 	HSIO,
 	TARGET_MAX,
 };
@@ -172,6 +187,24 @@ enum ocelot_reg {
 	ANA_POL_FLOWC,
 	ANA_POL_HYST,
 	ANA_POL_MISC_CFG,
+	PTP_MISC_CFG = PTP << TARGET_OFFSET,
+	PTP_CLK_ADJ_CFG,
+	PTP_CLK_ADJ_FRQ,
+	PTP_PIN_INTR,
+	PTP_PIN_INTR_ENA,
+	PTP_INTR_IDENT,
+	PTP_SYS_CLK_CFG,
+	PTP_CUR_NSF,
+	PTP_CUR_NSEC,
+	PTP_CUR_SEC_LSB,
+	PTP_CUR_SEC_MSB,
+	PTP_PIN_CFG,
+	PTP_TOD_SEC_MSB,
+	PTP_TOD_SEC_LSB,
+	PTP_TOD_NSEC,
+	PTP_NSF,
+	PTP_PIN_WF_HIGH_PERIOD,
+	PTP_PIN_WF_LOW_PERIOD,
 	QS_XTR_GRP_CFG = QS << TARGET_OFFSET,
 	QS_XTR_RD,
 	QS_XTR_FRM_PRUNING,
@@ -334,6 +367,14 @@ enum ocelot_reg {
 	SYS_CM_DATA_RD,
 	SYS_CM_OP,
 	SYS_CM_DATA,
+	S2_CORE_UPDATE_CTRL = S2 << TARGET_OFFSET,
+	S2_CORE_MV_CFG,
+	S2_CACHE_ENTRY_DAT,
+	S2_CACHE_MASK_DAT,
+	S2_CACHE_ACTION_DAT,
+	S2_CACHE_CNT_DAT,
+	S2_CACHE_TG_DAT,
+	GCB_SOFT_RST = GCB << TARGET_OFFSET,
 };
 
 enum ocelot_regfield {
@@ -381,6 +422,20 @@ enum ocelot_regfield {
 	SYS_RESET_CFG_CORE_ENA,
 	SYS_RESET_CFG_MEM_ENA,
 	SYS_RESET_CFG_MEM_INIT,
+	GCB_SOFT_RST_SWC_RST,
+	ANA_TABLES_STREAMDATA_SFID_0,
+	ANA_TABLES_STREAMDATA_SFID_VALID_0,
+	ANA_TABLES_SFIDTIDX_SFID_INDEX_0,
+	ANA_SG_ACCESS_CTRL_CONFIG_CHANGE_0,
+	ANA_SG_ACCESS_CTRL_SGID_0,
+	ANA_SG_CONFIG_REG_3_GATE_ENABLE_0,
+	QSYS_TAS_PARAM_CFG_CTRL_PORT_NUM_0,
+	QSYS_GCL_STATUS_REG_1_GCL_ENTRY_NUM_0,
+	QSYS_GCL_CFG_REG_1_GATE_STATE_0,
+	QSYS_GCL_CFG_REG_1_GCL_ENTRY_NUM_0,
+	QSYS_TAS_PARAM_CFG_CTRL_CONFIG_CHANGE_0,
+	QSYS_TAG_CONFIG_ENABLE_0,
+	SYS_STAT_CFG_STAT_VIEW_0,
 	REGFIELD_MAX
 };
 
@@ -392,6 +447,13 @@ struct ocelot_multicast {
 };
 
 struct ocelot_port;
+
+enum ocelot_ptp_pins {
+	ALT_PPS_PIN	= 1,
+	EXT_CLK_PIN,
+	ALT_LDST_PIN,
+	TOD_ACC_PIN
+};
 
 struct ocelot_stat_layout {
 	u32 offset;
@@ -419,6 +481,7 @@ struct ocelot {
 
 	u8 num_phys_ports;
 	u8 num_cpu_ports;
+	u8 cpu_port_id;
 	struct ocelot_port **ports;
 
 	u32 *lags;
@@ -433,12 +496,31 @@ struct ocelot {
 	u64 *stats;
 	struct delayed_work stats_work;
 	struct workqueue_struct *stats_queue;
+	struct workqueue_struct *ocelot_wq;
+	struct work_struct irq_handle_work;
+
+	struct list_head skbs;
+
+	void (*port_pcs_init)(struct ocelot_port *port);
+	struct net_device *cpu_port_ndev;
+
+	struct ptp_clock_info ptp_caps;
+	struct ptp_clock *clock;
+	int phc_index;
+};
+
+struct ocelot_skb {
+	struct list_head head;
+	struct sk_buff *skb;
+	u8 tstamp_id;
+	u8 tx_port;
 };
 
 struct ocelot_port {
 	struct net_device *dev;
 	struct ocelot *ocelot;
 	struct phy_device *phy;
+	struct device_node *portnp;
 	void __iomem *regs;
 	u8 chip_port;
 
@@ -454,6 +536,17 @@ struct ocelot_port {
 
 	phy_interface_t phy_mode;
 	struct phy *serdes;
+
+	struct ocelot_port_tc tc;
+
+	/* cpu frame injection handler */
+	netdev_tx_t (*cpu_inj_handler)(struct sk_buff *skb,
+				       struct net_device *dev);
+	void *cpu_inj_handler_data;
+	struct hwtstamp_config hwtstamp_config;
+	bool tx_tstamp;
+	bool rx_tstamp;
+	u8 tstamp_id;
 };
 
 u32 __ocelot_read_ix(struct ocelot *ocelot, u32 reg, u32 offset);
@@ -480,9 +573,7 @@ void ocelot_port_writel(struct ocelot_port *port, u32 val, u32 reg);
 
 int ocelot_regfields_init(struct ocelot *ocelot,
 			  const struct reg_field *const regfields);
-struct regmap *ocelot_io_platform_init(struct ocelot *ocelot,
-				       struct platform_device *pdev,
-				       const char *name);
+struct regmap *ocelot_io_init(struct ocelot *ocelot, struct resource *res);
 
 #define ocelot_field_write(ocelot, reg, val) regmap_field_write((ocelot)->regfields[(reg)], (val))
 #define ocelot_field_read(ocelot, reg, val) regmap_field_read((ocelot)->regfields[(reg)], (val))
@@ -490,9 +581,20 @@ struct regmap *ocelot_io_platform_init(struct ocelot *ocelot,
 int ocelot_init(struct ocelot *ocelot);
 void ocelot_deinit(struct ocelot *ocelot);
 int ocelot_chip_init(struct ocelot *ocelot);
+int felix_chip_init(struct ocelot *ocelot);
 int ocelot_probe_port(struct ocelot *ocelot, u8 port,
 		      void __iomem *regs,
 		      struct phy_device *phy);
+#ifdef CONFIG_MSCC_FELIX_SWITCH_PTP_CLOCK
+int felix_ptp_init(struct ocelot *ocelot);
+void felix_ptp_remove(struct ocelot *ocelot);
+int felix_ptp_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts);
+#else
+static inline int felix_ptp_init(struct ocelot *ocelot) { return 0; }
+static inline void felix_ptp_remove(struct ocelot *ocelot) { }
+static inline int felix_ptp_gettime(struct ptp_clock_info *ptp,
+				    struct timespec64 *ts) { return 0; }
+#endif
 
 extern struct notifier_block ocelot_netdevice_nb;
 extern struct notifier_block ocelot_switchdev_nb;

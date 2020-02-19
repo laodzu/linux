@@ -1,0 +1,6 @@
+config DRM_IMX_HDP
+	tristate "IMX8 HD Display Controller"
+	select MX8_HDP
+	depends on DRM_IMX
+	help
+	  Choose this if you want to use DP/HDMI on i.MX8 Or LS1028A.

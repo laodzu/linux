@@ -3263,6 +3263,7 @@ int dwc3_gadget_init(struct dwc3 *dwc)
 {
 	int ret;
 	int irq;
+	u32	reg;
 
 	irq = dwc3_gadget_get_irq(dwc);
 	if (irq < 0) {
@@ -3342,6 +3343,12 @@ int dwc3_gadget_init(struct dwc3 *dwc)
 	}
 
 	dwc3_gadget_set_speed(&dwc->gadget, dwc->maximum_speed);
+
+	if (dwc->disable_devinit_u1u2_quirk) {
+		reg = dwc3_readl(dwc->regs, DWC3_DCTL);
+		reg &= ~(DWC3_DCTL_INITU1ENA | DWC3_DCTL_INITU2ENA);
+		dwc3_writel(dwc->regs, DWC3_DCTL, reg);
+	}
 
 	return 0;
 

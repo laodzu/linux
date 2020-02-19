@@ -28,6 +28,10 @@ static char dpaa2_ethtool_stats[][ETH_GSTRING_LEN] = {
 	"[hw] rx nobuffer discards",
 	"[hw] tx discarded frames",
 	"[hw] tx confirmed frames",
+	"[hw] tx dequeued bytes",
+	"[hw] tx dequeued frames",
+	"[hw] tx rejected bytes",
+	"[hw] tx rejected frames",
 };
 
 #define DPAA2_ETH_NUM_STATS	ARRAY_SIZE(dpaa2_ethtool_stats)
@@ -74,6 +78,44 @@ static void dpaa2_eth_get_drvinfo(struct net_device *net_dev,
 		sizeof(drvinfo->bus_info));
 }
 
+#define DPNI_LINK_AUTONEG_VER_MAJOR		7
+#define DPNI_LINK_AUTONEG_VER_MINOR		8
+
+struct dpaa2_eth_link_mode_map {
+	u64 dpni_lm;
+	u64 ethtool_lm;
+};
+
+static const struct dpaa2_eth_link_mode_map dpaa2_eth_lm_map[] = {
+	{DPNI_ADVERTISED_10BASET_FULL, ETHTOOL_LINK_MODE_10baseT_Full_BIT},
+	{DPNI_ADVERTISED_100BASET_FULL, ETHTOOL_LINK_MODE_100baseT_Full_BIT},
+	{DPNI_ADVERTISED_1000BASET_FULL, ETHTOOL_LINK_MODE_1000baseT_Full_BIT},
+	{DPNI_ADVERTISED_10000BASET_FULL, ETHTOOL_LINK_MODE_10000baseT_Full_BIT},
+	{DPNI_ADVERTISED_2500BASEX_FULL, ETHTOOL_LINK_MODE_2500baseT_Full_BIT},
+	{DPNI_ADVERTISED_AUTONEG, ETHTOOL_LINK_MODE_Autoneg_BIT},
+};
+
+static void link_mode_dpni2ethtool(u64 dpni_lm, unsigned long *ethtool_lm)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dpaa2_eth_lm_map); i++) {
+		if (dpni_lm & dpaa2_eth_lm_map[i].dpni_lm)
+			__set_bit(dpaa2_eth_lm_map[i].ethtool_lm, ethtool_lm);
+	}
+}
+
+static void link_mode_ethtool2dpni(const unsigned long *ethtool_lm,
+				   u64 *dpni_lm)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dpaa2_eth_lm_map); i++) {
+		if (test_bit(dpaa2_eth_lm_map[i].ethtool_lm, ethtool_lm))
+			*dpni_lm |= dpaa2_eth_lm_map[i].dpni_lm;
+	}
+}
+
 static int
 dpaa2_eth_get_link_ksettings(struct net_device *net_dev,
 			     struct ethtool_link_ksettings *link_settings)
@@ -82,17 +124,27 @@ dpaa2_eth_get_link_ksettings(struct net_device *net_dev,
 	int err = 0;
 	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
 
-	err = dpni_get_link_state(priv->mc_io, 0, priv->mc_token, &state);
-	if (err) {
-		netdev_err(net_dev, "ERROR %d getting link state\n", err);
-		goto out;
+	if (dpaa2_eth_cmp_dpni_ver(priv, DPNI_LINK_AUTONEG_VER_MAJOR,
+				   DPNI_LINK_AUTONEG_VER_MINOR) < 0) {
+		err = dpni_get_link_state(priv->mc_io, 0, priv->mc_token,
+					  &state);
+		if (err) {
+			netdev_err(net_dev, "dpni_get_link_state failed\n");
+			goto out;
+		}
+	} else {
+		err = dpni_get_link_state_v2(priv->mc_io, 0, priv->mc_token,
+					     &state);
+		if (err) {
+			netdev_err(net_dev, "dpni_get_link_state_v2 failed\n");
+			goto out;
+		}
+		link_mode_dpni2ethtool(state.supported,
+				       link_settings->link_modes.supported);
+		link_mode_dpni2ethtool(state.advertising,
+				       link_settings->link_modes.advertising);
 	}
 
-	/* At the moment, we have no way of interrogating the DPMAC
-	 * from the DPNI side - and for that matter there may exist
-	 * no DPMAC at all. So for now we just don't report anything
-	 * beyond the DPNI attributes.
-	 */
 	if (state.options & DPNI_LINK_OPT_AUTONEG)
 		link_settings->base.autoneg = AUTONEG_ENABLE;
 	if (!(state.options & DPNI_LINK_OPT_HALF_DUPLEX))
@@ -109,8 +161,9 @@ static int
 dpaa2_eth_set_link_ksettings(struct net_device *net_dev,
 			     const struct ethtool_link_ksettings *link_settings)
 {
-	struct dpni_link_cfg cfg = {0};
 	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
+	struct dpni_link_state state = {0};
+	struct dpni_link_cfg cfg = {0};
 	int err = 0;
 
 	/* If using an older MC version, the DPNI must be down
@@ -125,6 +178,14 @@ dpaa2_eth_set_link_ksettings(struct net_device *net_dev,
 		}
 	}
 
+	/* Need to interrogate link state to get flow control params */
+	err = dpni_get_link_state(priv->mc_io, 0, priv->mc_token, &state);
+	if (err) {
+		netdev_err(net_dev, "Error getting link state\n");
+		goto out;
+	}
+
+	cfg.options = state.options;
 	cfg.rate = link_settings->base.speed;
 	if (link_settings->base.autoneg == AUTONEG_ENABLE)
 		cfg.options |= DPNI_LINK_OPT_AUTONEG;
@@ -135,13 +196,92 @@ dpaa2_eth_set_link_ksettings(struct net_device *net_dev,
 	else
 		cfg.options &= ~DPNI_LINK_OPT_HALF_DUPLEX;
 
-	err = dpni_set_link_cfg(priv->mc_io, 0, priv->mc_token, &cfg);
+	if (dpaa2_eth_cmp_dpni_ver(priv, DPNI_LINK_AUTONEG_VER_MAJOR,
+				   DPNI_LINK_AUTONEG_VER_MINOR) < 0) {
+		err = dpni_set_link_cfg(priv->mc_io, 0, priv->mc_token, &cfg);
+	} else {
+		link_mode_ethtool2dpni(link_settings->link_modes.advertising,
+				       &cfg.advertising);
+		dpni_set_link_cfg_v2(priv->mc_io, 0, priv->mc_token, &cfg);
+	}
 	if (err)
-		/* ethtool will be loud enough if we return an error; no point
-		 * in putting our own error message on the console by default
-		 */
-		netdev_dbg(net_dev, "ERROR %d setting link cfg\n", err);
+		netdev_err(net_dev, "dpni_set_link_cfg failed");
 
+out:
+	return err;
+}
+
+static void dpaa2_eth_get_pauseparam(struct net_device *net_dev,
+				     struct ethtool_pauseparam *pause)
+{
+	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
+	struct dpni_link_state state = {0};
+	int err;
+
+	err = dpni_get_link_state(priv->mc_io, 0, priv->mc_token, &state);
+	if (err)
+		netdev_dbg(net_dev, "Error getting link state\n");
+
+	/* Report general port autonegotiation status */
+	pause->autoneg = !!(state.options & DPNI_LINK_OPT_AUTONEG);
+	pause->rx_pause = !!(state.options & DPNI_LINK_OPT_PAUSE);
+	pause->tx_pause = pause->rx_pause ^
+			  !!(state.options & DPNI_LINK_OPT_ASYM_PAUSE);
+}
+
+static int dpaa2_eth_set_pauseparam(struct net_device *net_dev,
+				    struct ethtool_pauseparam *pause)
+{
+	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
+	struct dpni_link_state state = {0};
+	struct dpni_link_cfg cfg = {0};
+	u32 current_tx_pause;
+	int err = 0;
+
+	err = dpni_get_link_state(priv->mc_io, 0, priv->mc_token, &state);
+	if (err) {
+		netdev_dbg(net_dev, "Error getting link state\n");
+		goto out;
+	}
+
+	cfg.rate = state.rate;
+	cfg.options = state.options;
+	current_tx_pause = !!(cfg.options & DPNI_LINK_OPT_PAUSE) ^
+			   !!(cfg.options & DPNI_LINK_OPT_ASYM_PAUSE);
+
+	/* We don't support changing pause frame autonegotiation separately
+	 * from general port autoneg
+	 */
+	if (pause->autoneg != !!(state.options & DPNI_LINK_OPT_AUTONEG))
+		netdev_warn(net_dev,
+			    "Cannot change pause frame autoneg separately\n");
+
+	if (pause->rx_pause)
+		cfg.options |= DPNI_LINK_OPT_PAUSE;
+	else
+		cfg.options &= ~DPNI_LINK_OPT_PAUSE;
+
+	if (pause->rx_pause ^ pause->tx_pause)
+		cfg.options |= DPNI_LINK_OPT_ASYM_PAUSE;
+	else
+		cfg.options &= ~DPNI_LINK_OPT_ASYM_PAUSE;
+
+	err = dpni_set_link_cfg(priv->mc_io, 0, priv->mc_token, &cfg);
+	if (err) {
+		netdev_dbg(net_dev, "Error setting link\n");
+		goto out;
+	}
+
+	/* Enable/disable Rx FQ taildrop if Tx pause frames have changed */
+	if (current_tx_pause == pause->tx_pause)
+		goto out;
+
+	priv->tx_pause_frames = pause->tx_pause;
+	err = set_rx_taildrop(priv);
+	if (err)
+		netdev_dbg(net_dev, "Error configuring taildrop\n");
+
+out:
 	return err;
 }
 
@@ -197,9 +337,9 @@ static void dpaa2_eth_get_ethtool_stats(struct net_device *net_dev,
 	       sizeof(u64) * (DPAA2_ETH_NUM_STATS + DPAA2_ETH_NUM_EXTRA_STATS));
 
 	/* Print standard counters, from DPNI statistics */
-	for (j = 0; j <= 2; j++) {
+	for (j = 0; j <= 3; j++) {
 		err = dpni_get_statistics(priv->mc_io, 0, priv->mc_token,
-					  j, &dpni_stats);
+					  j, 0, &dpni_stats);
 		if (err != 0)
 			netdev_warn(net_dev, "dpni_get_stats(%d) failed\n", j);
 		switch (j) {
@@ -211,6 +351,9 @@ static void dpaa2_eth_get_ethtool_stats(struct net_device *net_dev,
 			break;
 		case 2:
 			num_cnt = sizeof(dpni_stats.page_2) / sizeof(u64);
+			break;
+		case 3:
+			num_cnt = sizeof(dpni_stats.page_3) / sizeof(u64);
 			break;
 		}
 		for (k = 0; k < num_cnt; k++)
@@ -228,7 +371,7 @@ static void dpaa2_eth_get_ethtool_stats(struct net_device *net_dev,
 	/* Per-channel stats */
 	for (k = 0; k < priv->num_channels; k++) {
 		ch_stats = &priv->channel[k]->stats;
-		for (j = 0; j < sizeof(*ch_stats) / sizeof(__u64); j++)
+		for (j = 0; j < sizeof(*ch_stats) / sizeof(__u64) - 1; j++)
 			*((__u64 *)data + i + j) += *((__u64 *)ch_stats + j);
 	}
 	i += j;
@@ -495,7 +638,7 @@ static int do_cls_rule(struct net_device *net_dev,
 	dma_addr_t key_iova;
 	u64 fields = 0;
 	void *key_buf;
-	int err;
+	int i, err = 0;
 
 	if (fs->ring_cookie != RX_CLS_FLOW_DISC &&
 	    fs->ring_cookie >= dpaa2_eth_queue_count(priv))
@@ -555,11 +698,18 @@ static int do_cls_rule(struct net_device *net_dev,
 			fs_act.options |= DPNI_FS_OPT_DISCARD;
 		else
 			fs_act.flow_id = fs->ring_cookie;
-		err = dpni_add_fs_entry(priv->mc_io, 0, priv->mc_token, 0,
-					fs->location, &rule_cfg, &fs_act);
-	} else {
-		err = dpni_remove_fs_entry(priv->mc_io, 0, priv->mc_token, 0,
-					   &rule_cfg);
+	}
+	for (i = 0; i < dpaa2_eth_tc_count(priv); i++) {
+		if (add)
+			err = dpni_add_fs_entry(priv->mc_io, 0, priv->mc_token,
+						i, fs->location, &rule_cfg,
+						&fs_act);
+		else
+			err = dpni_remove_fs_entry(priv->mc_io, 0,
+						   priv->mc_token, i,
+						   &rule_cfg);
+		if (err)
+			break;
 	}
 
 	dma_unmap_single(dev, key_iova, rule_cfg.key_size * 2, DMA_TO_DEVICE);
@@ -722,6 +872,8 @@ const struct ethtool_ops dpaa2_ethtool_ops = {
 	.get_link = ethtool_op_get_link,
 	.get_link_ksettings = dpaa2_eth_get_link_ksettings,
 	.set_link_ksettings = dpaa2_eth_set_link_ksettings,
+	.get_pauseparam = dpaa2_eth_get_pauseparam,
+	.set_pauseparam = dpaa2_eth_set_pauseparam,
 	.get_sset_count = dpaa2_eth_get_sset_count,
 	.get_ethtool_stats = dpaa2_eth_get_ethtool_stats,
 	.get_strings = dpaa2_eth_get_strings,

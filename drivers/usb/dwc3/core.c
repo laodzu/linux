@@ -100,6 +100,41 @@ static int dwc3_get_dr_mode(struct dwc3 *dwc)
 	return 0;
 }
 
+/*
+ * dwc3_power_of_all_roothub_ports - Power off all Root hub ports
+ * @dwc3: Pointer to our controller context structure
+ */
+static void dwc3_power_off_all_roothub_ports(struct dwc3 *dwc)
+{
+	int i, port_num;
+	u32 reg, op_regs_base, offset;
+	void __iomem		*xhci_regs;
+
+	/* xhci regs is not mapped yet, do it temperary here */
+	if (dwc->xhci_resources[0].start) {
+		xhci_regs = ioremap(dwc->xhci_resources[0].start,
+				DWC3_XHCI_REGS_END);
+		if (IS_ERR(xhci_regs)) {
+			dev_err(dwc->dev, "Failed to ioremap xhci_regs\n");
+			return;
+		}
+
+		op_regs_base = HC_LENGTH(readl(xhci_regs));
+		reg = readl(xhci_regs + XHCI_HCSPARAMS1);
+		port_num = HCS_MAX_PORTS(reg);
+
+		for (i = 1; i <= port_num; i++) {
+			offset = op_regs_base + XHCI_PORTSC_BASE + 0x10*(i-1);
+			reg = readl(xhci_regs + offset);
+			reg &= ~PORT_POWER;
+			writel(reg, xhci_regs + offset);
+		}
+
+		iounmap(xhci_regs);
+	} else
+		dev_err(dwc->dev, "xhci base reg invalid\n");
+}
+
 void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode)
 {
 	u32 reg;
@@ -108,6 +143,15 @@ void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode)
 	reg &= ~(DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG));
 	reg |= DWC3_GCTL_PRTCAPDIR(mode);
 	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
+
+	/*
+	 * We have to power off all Root hub ports immediately after DWC3 set
+	 * to host mode to avoid VBUS glitch happen when xhci get reset later.
+	 */
+	if (dwc->host_vbus_glitches) {
+		if (mode == DWC3_GCTL_PRTCAP_HOST)
+			dwc3_power_off_all_roothub_ports(dwc);
+	}
 
 	dwc->current_dr_role = mode;
 }
@@ -282,6 +326,69 @@ static const struct clk_bulk_data dwc3_core_clks[] = {
 	{ .id = "bus_early" },
 	{ .id = "suspend" },
 };
+
+/*
+ * dwc3_set_cache_type - Configure cache type
+ * @dwc3: Pointer to our controller context structure
+ */
+static void dwc3_set_cache_type(struct dwc3 *dwc)
+{
+	int ret;
+	u32 tmp, reg, cache_type;
+	struct fwnode_handle *fwnode;
+
+	reg = dwc3_readl(dwc->regs,  DWC3_GSBUSCFG0);
+	tmp = reg;
+
+	fwnode = device_get_named_child_node(dwc->dev, "cache_type");
+	if (!fwnode) {
+		dev_info(dwc->dev, "Cache_type node no found, skip.\n");
+		return;
+	}
+
+	ret = fwnode_property_read_u32(fwnode,
+				       "transfer_type_datard", &cache_type);
+	if (ret) {
+		dev_err(dwc->dev,
+			"Can't find property transfer_type_datard.\n");
+		return;
+	}
+	reg &= ~DWC3_GSBUSCFG0_DATARD(~0);
+	reg |= DWC3_GSBUSCFG0_DATARD(cache_type);
+
+	ret = fwnode_property_read_u32(fwnode,
+				       "transfer_type_descrd", &cache_type);
+	if (ret) {
+		dev_err(dwc->dev,
+			"Can't find property transfer_type_descrd.\n");
+		return;
+	}
+	reg &= ~DWC3_GSBUSCFG0_DESCRD(~0);
+	reg |= DWC3_GSBUSCFG0_DESCRD(cache_type);
+
+	ret = fwnode_property_read_u32(fwnode,
+				       "transfer_type_datawr", &cache_type);
+	if (ret) {
+		dev_err(dwc->dev,
+			"Can't find property transfer_type_datawr.\n");
+		return;
+	}
+	reg &= ~DWC3_GSBUSCFG0_DATAWR(~0);
+	reg |= DWC3_GSBUSCFG0_DATAWR(cache_type);
+
+	ret = fwnode_property_read_u32(fwnode,
+				       "transfer_type_descwr", &cache_type);
+	if (ret) {
+		dev_err(dwc->dev,
+			"Can't find property transfer_type_descwr.\n");
+		return;
+	}
+	reg &= ~DWC3_GSBUSCFG0_DESCWR(~0);
+	reg |= DWC3_GSBUSCFG0_DESCWR(cache_type);
+
+	if (tmp != reg)
+		dwc3_writel(dwc->regs, DWC3_GSBUSCFG0, reg);
+}
 
 /*
  * dwc3_frame_length_adjustment - Adjusts frame length if required
@@ -942,6 +1049,7 @@ static int dwc3_core_init(struct dwc3 *dwc)
 	dwc3_frame_length_adjustment(dwc);
 
 	dwc3_set_incr_burst_type(dwc);
+	dwc3_set_cache_type(dwc);
 
 	usb_phy_set_suspend(dwc->usb2_phy, 0);
 	usb_phy_set_suspend(dwc->usb3_phy, 0);
@@ -1206,6 +1314,7 @@ static void dwc3_core_exit_mode(struct dwc3 *dwc)
 static void dwc3_get_properties(struct dwc3 *dwc)
 {
 	struct device		*dev = dwc->dev;
+	struct device_node      *node = dev->of_node;
 	u8			lpm_nyet_threshold;
 	u8			tx_de_emphasis;
 	u8			hird_threshold;
@@ -1291,8 +1400,16 @@ static void dwc3_get_properties(struct dwc3 *dwc)
 	dwc->dis_tx_ipgap_linecheck_quirk = device_property_read_bool(dev,
 				"snps,dis-tx-ipgap-linecheck-quirk");
 
+	dwc->quirk_reverse_in_out = device_property_read_bool(dev,
+				"snps,quirk_reverse_in_out");
+	dwc->quirk_stop_transfer_in_block = device_property_read_bool(dev,
+				"snps,quirk_stop_transfer_in_block");
+	dwc->quirk_stop_ep_in_u1 = device_property_read_bool(dev,
+				"snps,quirk_stop_ep_in_u1");
 	dwc->tx_de_emphasis_quirk = device_property_read_bool(dev,
 				"snps,tx_de_emphasis_quirk");
+	dwc->disable_devinit_u1u2_quirk = device_property_read_bool(dev,
+				"snps,disable_devinit_u1u2");
 	device_property_read_u8(dev, "snps,tx_de_emphasis",
 				&tx_de_emphasis);
 	device_property_read_string(dev, "snps,hsphy_interface",
@@ -1302,6 +1419,9 @@ static void dwc3_get_properties(struct dwc3 *dwc)
 
 	dwc->dis_metastability_quirk = device_property_read_bool(dev,
 				"snps,dis_metastability_quirk");
+
+	dwc->host_vbus_glitches = device_property_read_bool(dev,
+				"snps,host-vbus-glitches");
 
 	dwc->lpm_nyet_threshold = lpm_nyet_threshold;
 	dwc->tx_de_emphasis = tx_de_emphasis;

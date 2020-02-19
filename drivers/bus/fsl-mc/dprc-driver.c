@@ -156,6 +156,8 @@ static void check_plugged_state_change(struct fsl_mc_device *mc_dev,
  * dprc_add_new_devices - Adds devices to the logical bus for a DPRC
  *
  * @mc_bus_dev: pointer to the fsl-mc device that represents a DPRC object
+ * @driver_override: driver override to apply to new objects found in the
+ * DPRC, or NULL, if none.
  * @obj_desc_array: array of device descriptors for child devices currently
  * present in the physical DPRC.
  * @num_child_objects_in_mc: number of entries in obj_desc_array
@@ -165,6 +167,7 @@ static void check_plugged_state_change(struct fsl_mc_device *mc_dev,
  * in the physical DPRC.
  */
 static void dprc_add_new_devices(struct fsl_mc_device *mc_bus_dev,
+				 const char *driver_override,
 				 struct fsl_mc_obj_desc *obj_desc_array,
 				 int num_child_objects_in_mc)
 {
@@ -189,7 +192,7 @@ static void dprc_add_new_devices(struct fsl_mc_device *mc_bus_dev,
 		}
 
 		error = fsl_mc_device_add(obj_desc, NULL, &mc_bus_dev->dev,
-					  &child_dev);
+					  driver_override, &child_dev);
 		if (error < 0)
 			continue;
 	}
@@ -199,6 +202,8 @@ static void dprc_add_new_devices(struct fsl_mc_device *mc_bus_dev,
  * dprc_scan_objects - Discover objects in a DPRC
  *
  * @mc_bus_dev: pointer to the fsl-mc device that represents a DPRC object
+ * @driver_override: driver override to apply to new objects found in the
+ * DPRC, or NULL, if none.
  * @total_irq_count: If argument is provided the function populates the
  * total number of IRQs created by objects in the DPRC.
  *
@@ -214,8 +219,9 @@ static void dprc_add_new_devices(struct fsl_mc_device *mc_bus_dev,
  * populated before they can get allocation requests from probe callbacks
  * of the device drivers for the non-allocatable devices.
  */
-static int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
-			     unsigned int *total_irq_count)
+int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
+		      const char *driver_override,
+		      unsigned int *total_irq_count)
 {
 	int num_child_objects;
 	int dprc_get_obj_failures;
@@ -315,7 +321,7 @@ static int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
 	dprc_remove_devices(mc_bus_dev, child_obj_desc_array,
 			    num_child_objects);
 
-	dprc_add_new_devices(mc_bus_dev, child_obj_desc_array,
+	dprc_add_new_devices(mc_bus_dev, driver_override, child_obj_desc_array,
 			     num_child_objects);
 
 	if (child_obj_desc_array)
@@ -344,7 +350,7 @@ static int dprc_scan_container(struct fsl_mc_device *mc_bus_dev)
 	 * Discover objects in the DPRC:
 	 */
 	mutex_lock(&mc_bus->scan_mutex);
-	error = dprc_scan_objects(mc_bus_dev, NULL);
+	error = dprc_scan_objects(mc_bus_dev, NULL, NULL);
 	mutex_unlock(&mc_bus->scan_mutex);
 	if (error < 0) {
 		fsl_mc_cleanup_all_resource_pools(mc_bus_dev);
@@ -353,6 +359,33 @@ static int dprc_scan_container(struct fsl_mc_device *mc_bus_dev)
 
 	return 0;
 }
+
+static ssize_t rescan_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct fsl_mc_device *root_mc_dev;
+	struct fsl_mc_bus *root_mc_bus;
+	unsigned long val;
+
+	if (!fsl_mc_is_root_dprc(dev))
+		return -EINVAL;
+
+	root_mc_dev = to_fsl_mc_device(dev);
+	root_mc_bus = to_fsl_mc_bus(root_mc_dev);
+
+	if (kstrtoul(buf, 0, &val) < 0)
+		return -EINVAL;
+
+	if (val) {
+		mutex_lock(&root_mc_bus->scan_mutex);
+		dprc_scan_objects(root_mc_dev, NULL, NULL);
+		mutex_unlock(&root_mc_bus->scan_mutex);
+	}
+
+	return count;
+}
+static DEVICE_ATTR_WO(rescan);
 
 /**
  * dprc_irq0_handler - Regular ISR for DPRC interrupt 0
@@ -415,7 +448,7 @@ static irqreturn_t dprc_irq0_handler_thread(int irq_num, void *arg)
 		      DPRC_IRQ_EVENT_OBJ_CREATED)) {
 		unsigned int irq_count;
 
-		error = dprc_scan_objects(mc_dev, &irq_count);
+		error = dprc_scan_objects(mc_dev, NULL, &irq_count);
 		if (error < 0) {
 			/*
 			 * If the error is -ENXIO, we ignore it, as it indicates
@@ -647,6 +680,12 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
 		} else {
 			dev_set_msi_domain(&mc_dev->dev, mc_msi_domain);
 			msi_domain_set = true;
+
+			error = fsl_mc_uapi_create_device_file(mc_bus);
+			if (error < 0) {
+				error = -EPROBE_DEFER;
+				goto error_cleanup_msi_domain;
+			}
 		}
 	}
 
@@ -654,7 +693,7 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
 			  &mc_dev->mc_handle);
 	if (error < 0) {
 		dev_err(&mc_dev->dev, "dprc_open() failed: %d\n", error);
-		goto error_cleanup_msi_domain;
+		goto error_cleanup_uapi;
 	}
 
 	error = dprc_get_attributes(mc_dev->mc_io, 0, mc_dev->mc_handle,
@@ -686,6 +725,13 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
 
 	mutex_init(&mc_bus->scan_mutex);
 
+	error = device_create_file(&mc_dev->dev, &dev_attr_rescan);
+	if (error < 0) {
+		dev_err(&mc_dev->dev, "device_create_file() failed: %d\n",
+			error);
+		goto error_cleanup_open;
+	}
+
 	/*
 	 * Discover MC objects in DPRC object:
 	 */
@@ -705,6 +751,10 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
 
 error_cleanup_open:
 	(void)dprc_close(mc_dev->mc_io, 0, mc_dev->mc_handle);
+
+error_cleanup_uapi:
+	if (fsl_mc_is_root_dprc(&mc_dev->dev))
+		fsl_mc_uapi_remove_device_file(mc_bus);
 
 error_cleanup_msi_domain:
 	if (msi_domain_set)
@@ -774,7 +824,11 @@ static int dprc_remove(struct fsl_mc_device *mc_dev)
 	if (!fsl_mc_is_root_dprc(&mc_dev->dev)) {
 		fsl_destroy_mc_io(mc_dev->mc_io);
 		mc_dev->mc_io = NULL;
+	} else {
+		fsl_mc_uapi_remove_device_file(mc_bus);
 	}
+
+	device_remove_file(&mc_dev->dev, &dev_attr_rescan);
 
 	dev_info(&mc_dev->dev, "DPRC device unbound from driver");
 	return 0;

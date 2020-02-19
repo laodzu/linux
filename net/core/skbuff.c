@@ -72,6 +72,7 @@
 #include <linux/highmem.h>
 #include <linux/capability.h>
 #include <linux/user_namespace.h>
+#include <linux/indirect_call_wrapper.h>
 
 #include "datagram.h"
 
@@ -817,6 +818,32 @@ void napi_consume_skb(struct sk_buff *skb, int budget)
 }
 EXPORT_SYMBOL(napi_consume_skb);
 
+/**
+ * 	skb_recycle - clean up an skb for reuse
+ * 	@skb: buffer
+ *
+ * 	Recycles the skb to be reused as a receive buffer. This
+ * 	function does any necessary reference count dropping, and
+ * 	cleans up the skbuff as if it just came from __alloc_skb().
+ */
+void skb_recycle(struct sk_buff *skb)
+{
+	struct skb_shared_info *shinfo;
+	u8 head_frag = skb->head_frag;
+
+	skb_release_head_state(skb);
+
+	shinfo = skb_shinfo(skb);
+	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+	atomic_set(&shinfo->dataref, 1);
+
+	memset(skb, 0, offsetof(struct sk_buff, tail));
+	skb->data = skb->head + NET_SKB_PAD;
+	skb->head_frag = head_frag;
+	skb_reset_tail_pointer(skb);
+}
+EXPORT_SYMBOL(skb_recycle);
+
 /* Make sure a field is enclosed inside headers_start/headers_end section */
 #define CHECK_SKB_FIELD(field) \
 	BUILD_BUG_ON(offsetof(struct sk_buff, field) <		\
@@ -907,6 +934,31 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 	return n;
 #undef C
 }
+
+/**
+ * alloc_skb_for_msg() - allocate sk_buff to wrap frag list forming a msg
+ * @first: first sk_buff of the msg
+ */
+struct sk_buff *alloc_skb_for_msg(struct sk_buff *first)
+{
+	struct sk_buff *n;
+
+	n = alloc_skb(0, GFP_ATOMIC);
+	if (!n)
+		return NULL;
+
+	n->len = first->len;
+	n->data_len = first->len;
+	n->truesize = first->truesize;
+
+	skb_shinfo(n)->frag_list = first;
+
+	__copy_skb_header(n, first);
+	n->destructor = NULL;
+
+	return n;
+}
+EXPORT_SYMBOL_GPL(alloc_skb_for_msg);
 
 /**
  *	skb_morph	-	morph one skb into another
@@ -2337,6 +2389,7 @@ do_frag_list:
 		kv.iov_base = skb->data + offset;
 		kv.iov_len = slen;
 		memset(&msg, 0, sizeof(msg));
+		msg.msg_flags = MSG_DONTWAIT;
 
 		ret = kernel_sendmsg_locked(sk, &msg, &kv, 1, slen);
 		if (ret <= 0)
@@ -2507,7 +2560,8 @@ __wsum __skb_checksum(const struct sk_buff *skb, int offset, int len,
 	if (copy > 0) {
 		if (copy > len)
 			copy = len;
-		csum = ops->update(skb->data + offset, copy, csum);
+		csum = INDIRECT_CALL_1(ops->update, csum_partial_ext,
+				       skb->data + offset, copy, csum);
 		if ((len -= copy) == 0)
 			return csum;
 		offset += copy;
@@ -2534,9 +2588,13 @@ __wsum __skb_checksum(const struct sk_buff *skb, int offset, int len,
 					      frag->page_offset + offset - start,
 					      copy, p, p_off, p_len, copied) {
 				vaddr = kmap_atomic(p);
-				csum2 = ops->update(vaddr + p_off, p_len, 0);
+				csum2 = INDIRECT_CALL_1(ops->update,
+							csum_partial_ext,
+							vaddr + p_off, p_len, 0);
 				kunmap_atomic(vaddr);
-				csum = ops->combine(csum, csum2, pos, p_len);
+				csum = INDIRECT_CALL_1(ops->combine,
+						       csum_block_add_ext, csum,
+						       csum2, pos, p_len);
 				pos += p_len;
 			}
 
@@ -2559,7 +2617,8 @@ __wsum __skb_checksum(const struct sk_buff *skb, int offset, int len,
 				copy = len;
 			csum2 = __skb_checksum(frag_iter, offset - start,
 					       copy, 0, ops);
-			csum = ops->combine(csum, csum2, pos, copy);
+			csum = INDIRECT_CALL_1(ops->combine, csum_block_add_ext,
+					       csum, csum2, pos, copy);
 			if ((len -= copy) == 0)
 				return csum;
 			offset += copy;

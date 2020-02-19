@@ -588,7 +588,7 @@ static struct kmemleak_object *create_object(unsigned long ptr, size_t size,
 	if (in_irq()) {
 		object->pid = 0;
 		strncpy(object->comm, "hardirq", sizeof(object->comm));
-	} else if (in_softirq()) {
+	} else if (in_serving_softirq()) {
 		object->pid = 0;
 		strncpy(object->comm, "softirq", sizeof(object->comm));
 	} else {
@@ -2118,14 +2118,9 @@ void __init kmemleak_init(void)
  */
 static int __init kmemleak_late_init(void)
 {
-	struct dentry *dentry;
-
 	kmemleak_initialized = 1;
 
-	dentry = debugfs_create_file("kmemleak", 0644, NULL, NULL,
-				     &kmemleak_fops);
-	if (!dentry)
-		pr_warn("Failed to create the debugfs kmemleak file\n");
+	debugfs_create_file("kmemleak", 0644, NULL, NULL, &kmemleak_fops);
 
 	if (kmemleak_error) {
 		/*

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
 /*
  * Copyright 2015-2016 Freescale Semiconductor Inc.
- * Copyright 2017-2018 NXP
+ * Copyright 2017-2019 NXP
  */
 
 #include "compat.h"
@@ -140,7 +140,8 @@ static struct caam_request *to_caam_req(struct crypto_async_request *areq)
 static void caam_unmap(struct device *dev, struct scatterlist *src,
 		       struct scatterlist *dst, int src_nents,
 		       int dst_nents, dma_addr_t iv_dma, int ivsize,
-		       dma_addr_t qm_sg_dma, int qm_sg_bytes)
+		       enum dma_data_direction iv_dir, dma_addr_t qm_sg_dma,
+		       int qm_sg_bytes)
 {
 	if (dst != src) {
 		if (src_nents)
@@ -152,7 +153,7 @@ static void caam_unmap(struct device *dev, struct scatterlist *src,
 	}
 
 	if (iv_dma)
-		dma_unmap_single(dev, iv_dma, ivsize, DMA_TO_DEVICE);
+		dma_unmap_single(dev, iv_dma, ivsize, iv_dir);
 
 	if (qm_sg_bytes)
 		dma_unmap_single(dev, qm_sg_dma, qm_sg_bytes, DMA_TO_DEVICE);
@@ -371,6 +372,7 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 	gfp_t flags = (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) ?
 		      GFP_KERNEL : GFP_ATOMIC;
 	int src_nents, mapped_src_nents, dst_nents = 0, mapped_dst_nents = 0;
+	int src_len, dst_len = 0;
 	struct aead_edesc *edesc;
 	dma_addr_t qm_sg_dma, iv_dma = 0;
 	int ivsize = 0;
@@ -387,23 +389,21 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 	}
 
 	if (unlikely(req->dst != req->src)) {
-		src_nents = sg_nents_for_len(req->src, req->assoclen +
-					     req->cryptlen);
+		src_len = req->assoclen + req->cryptlen;
+		dst_len = src_len + (encrypt ? authsize : (-authsize));
+
+		src_nents = sg_nents_for_len(req->src, src_len);
 		if (unlikely(src_nents < 0)) {
 			dev_err(dev, "Insufficient bytes (%d) in src S/G\n",
-				req->assoclen + req->cryptlen);
+				src_len);
 			qi_cache_free(edesc);
 			return ERR_PTR(src_nents);
 		}
 
-		dst_nents = sg_nents_for_len(req->dst, req->assoclen +
-					     req->cryptlen +
-					     (encrypt ? authsize :
-							(-authsize)));
+		dst_nents = sg_nents_for_len(req->dst, dst_len);
 		if (unlikely(dst_nents < 0)) {
 			dev_err(dev, "Insufficient bytes (%d) in dst S/G\n",
-				req->assoclen + req->cryptlen +
-				(encrypt ? authsize : (-authsize)));
+				dst_len);
 			qi_cache_free(edesc);
 			return ERR_PTR(dst_nents);
 		}
@@ -434,13 +434,13 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 			mapped_dst_nents = 0;
 		}
 	} else {
-		src_nents = sg_nents_for_len(req->src, req->assoclen +
-					     req->cryptlen +
-						(encrypt ? authsize : 0));
+		src_len = req->assoclen + req->cryptlen +
+			  (encrypt ? authsize : 0);
+
+		src_nents = sg_nents_for_len(req->src, src_len);
 		if (unlikely(src_nents < 0)) {
 			dev_err(dev, "Insufficient bytes (%d) in src S/G\n",
-				req->assoclen + req->cryptlen +
-				(encrypt ? authsize : 0));
+				src_len);
 			qi_cache_free(edesc);
 			return ERR_PTR(src_nents);
 		}
@@ -460,9 +460,25 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 	/*
 	 * Create S/G table: req->assoclen, [IV,] req->src [, req->dst].
 	 * Input is not contiguous.
+	 * HW reads 4 S/G entries at a time; make sure the reads don't go beyond
+	 * the end of the table by allocating more S/G entries. Logic:
+	 * if (src != dst && output S/G)
+	 *      pad output S/G, if needed
+	 * else if (src == dst && S/G)
+	 *      overlapping S/Gs; pad one of them
+	 * else if (input S/G) ...
+	 *      pad input S/G, if needed
 	 */
-	qm_sg_nents = 1 + !!ivsize + mapped_src_nents +
-		      (mapped_dst_nents > 1 ? mapped_dst_nents : 0);
+	qm_sg_nents = 1 + !!ivsize + mapped_src_nents;
+	if (mapped_dst_nents > 1)
+		qm_sg_nents += pad_sg_nents(mapped_dst_nents);
+	else if ((req->src == req->dst) && (mapped_src_nents > 1))
+		qm_sg_nents = max(pad_sg_nents(qm_sg_nents),
+				  1 + !!ivsize +
+				  pad_sg_nents(mapped_src_nents));
+	else
+		qm_sg_nents = pad_sg_nents(qm_sg_nents);
+
 	sg_table = &edesc->sgt[0];
 	qm_sg_bytes = qm_sg_nents * sizeof(*sg_table);
 	if (unlikely(offsetof(struct aead_edesc, sgt) + qm_sg_bytes + ivsize >
@@ -470,7 +486,7 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 		dev_err(dev, "No space for %d S/G entries and/or %dB IV\n",
 			qm_sg_nents, ivsize);
 		caam_unmap(dev, req->src, req->dst, src_nents, dst_nents, 0,
-			   0, 0, 0);
+			   0, DMA_NONE, 0, 0);
 		qi_cache_free(edesc);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -485,7 +501,7 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 		if (dma_mapping_error(dev, iv_dma)) {
 			dev_err(dev, "unable to map IV\n");
 			caam_unmap(dev, req->src, req->dst, src_nents,
-				   dst_nents, 0, 0, 0, 0);
+				   dst_nents, 0, 0, DMA_NONE, 0, 0);
 			qi_cache_free(edesc);
 			return ERR_PTR(-ENOMEM);
 		}
@@ -509,7 +525,7 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 	if (dma_mapping_error(dev, edesc->assoclen_dma)) {
 		dev_err(dev, "unable to map assoclen\n");
 		caam_unmap(dev, req->src, req->dst, src_nents, dst_nents,
-			   iv_dma, ivsize, 0, 0);
+			   iv_dma, ivsize, DMA_TO_DEVICE, 0, 0);
 		qi_cache_free(edesc);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -520,19 +536,18 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 		dma_to_qm_sg_one(sg_table + qm_sg_index, iv_dma, ivsize, 0);
 		qm_sg_index++;
 	}
-	sg_to_qm_sg_last(req->src, mapped_src_nents, sg_table + qm_sg_index, 0);
+	sg_to_qm_sg_last(req->src, src_len, sg_table + qm_sg_index, 0);
 	qm_sg_index += mapped_src_nents;
 
 	if (mapped_dst_nents > 1)
-		sg_to_qm_sg_last(req->dst, mapped_dst_nents, sg_table +
-				 qm_sg_index, 0);
+		sg_to_qm_sg_last(req->dst, dst_len, sg_table + qm_sg_index, 0);
 
 	qm_sg_dma = dma_map_single(dev, sg_table, qm_sg_bytes, DMA_TO_DEVICE);
 	if (dma_mapping_error(dev, qm_sg_dma)) {
 		dev_err(dev, "unable to map S/G table\n");
 		dma_unmap_single(dev, edesc->assoclen_dma, 4, DMA_TO_DEVICE);
 		caam_unmap(dev, req->src, req->dst, src_nents, dst_nents,
-			   iv_dma, ivsize, 0, 0);
+			   iv_dma, ivsize, DMA_TO_DEVICE, 0, 0);
 		qi_cache_free(edesc);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -559,6 +574,14 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 			dpaa2_fl_set_addr(out_fle, qm_sg_dma +
 					  (1 + !!ivsize) * sizeof(*sg_table));
 		}
+	} else if (!mapped_dst_nents) {
+		/*
+		 * crypto engine requires the output entry to be present when
+		 * "frame list" FD is used.
+		 * Since engine does not support FMT=2'b11 (unused entry type),
+		 * leaving out_fle zeroized is the best option.
+		 */
+		goto skip_out_fle;
 	} else if (mapped_dst_nents == 1) {
 		dpaa2_fl_set_format(out_fle, dpaa2_fl_single);
 		dpaa2_fl_set_addr(out_fle, sg_dma_address(req->dst));
@@ -570,7 +593,259 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
 
 	dpaa2_fl_set_len(out_fle, out_len);
 
+skip_out_fle:
 	return edesc;
+}
+
+static struct tls_edesc *tls_edesc_alloc(struct aead_request *req,
+					 bool encrypt)
+{
+	struct crypto_aead *tls = crypto_aead_reqtfm(req);
+	unsigned int blocksize = crypto_aead_blocksize(tls);
+	unsigned int padsize, authsize;
+	struct caam_request *req_ctx = aead_request_ctx(req);
+	struct dpaa2_fl_entry *in_fle = &req_ctx->fd_flt[1];
+	struct dpaa2_fl_entry *out_fle = &req_ctx->fd_flt[0];
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+	struct caam_aead_alg *alg = container_of(crypto_aead_alg(tls),
+						 typeof(*alg), aead);
+	struct device *dev = ctx->dev;
+	gfp_t flags = (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) ?
+		      GFP_KERNEL : GFP_ATOMIC;
+	int src_nents, mapped_src_nents, dst_nents = 0, mapped_dst_nents = 0;
+	struct tls_edesc *edesc;
+	dma_addr_t qm_sg_dma, iv_dma = 0;
+	int ivsize = 0;
+	u8 *iv;
+	int qm_sg_index, qm_sg_ents = 0, qm_sg_bytes;
+	int in_len, out_len;
+	struct dpaa2_sg_entry *sg_table;
+	struct scatterlist *dst;
+
+	if (encrypt) {
+		padsize = blocksize - ((req->cryptlen + ctx->authsize) %
+					blocksize);
+		authsize = ctx->authsize + padsize;
+	} else {
+		authsize = ctx->authsize;
+	}
+
+	/* allocate space for base edesc, link tables and IV */
+	edesc = qi_cache_zalloc(GFP_DMA | flags);
+	if (unlikely(!edesc)) {
+		dev_err(dev, "could not allocate extended descriptor\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	if (likely(req->src == req->dst)) {
+		src_nents = sg_nents_for_len(req->src, req->assoclen +
+					     req->cryptlen +
+					     (encrypt ? authsize : 0));
+		if (unlikely(src_nents < 0)) {
+			dev_err(dev, "Insufficient bytes (%d) in src S/G\n",
+				req->assoclen + req->cryptlen +
+				(encrypt ? authsize : 0));
+			qi_cache_free(edesc);
+			return ERR_PTR(src_nents);
+		}
+
+		mapped_src_nents = dma_map_sg(dev, req->src, src_nents,
+					      DMA_BIDIRECTIONAL);
+		if (unlikely(!mapped_src_nents)) {
+			dev_err(dev, "unable to map source\n");
+			qi_cache_free(edesc);
+			return ERR_PTR(-ENOMEM);
+		}
+		dst = req->dst;
+	} else {
+		src_nents = sg_nents_for_len(req->src, req->assoclen +
+					     req->cryptlen);
+		if (unlikely(src_nents < 0)) {
+			dev_err(dev, "Insufficient bytes (%d) in src S/G\n",
+				req->assoclen + req->cryptlen);
+			qi_cache_free(edesc);
+			return ERR_PTR(src_nents);
+		}
+
+		dst = scatterwalk_ffwd(edesc->tmp, req->dst, req->assoclen);
+		dst_nents = sg_nents_for_len(dst, req->cryptlen +
+					     (encrypt ? authsize : 0));
+		if (unlikely(dst_nents < 0)) {
+			dev_err(dev, "Insufficient bytes (%d) in dst S/G\n",
+				req->cryptlen +
+				(encrypt ? authsize : 0));
+			qi_cache_free(edesc);
+			return ERR_PTR(dst_nents);
+		}
+
+		if (src_nents) {
+			mapped_src_nents = dma_map_sg(dev, req->src,
+						      src_nents, DMA_TO_DEVICE);
+			if (unlikely(!mapped_src_nents)) {
+				dev_err(dev, "unable to map source\n");
+				qi_cache_free(edesc);
+				return ERR_PTR(-ENOMEM);
+			}
+		} else {
+			mapped_src_nents = 0;
+		}
+
+		mapped_dst_nents = dma_map_sg(dev, dst, dst_nents,
+					      DMA_FROM_DEVICE);
+		if (unlikely(!mapped_dst_nents)) {
+			dev_err(dev, "unable to map destination\n");
+			dma_unmap_sg(dev, req->src, src_nents, DMA_TO_DEVICE);
+			qi_cache_free(edesc);
+			return ERR_PTR(-ENOMEM);
+		}
+	}
+
+	/*
+	 * Create S/G table: IV, src, dst.
+	 * Input is not contiguous.
+	 */
+	qm_sg_ents = 1 + mapped_src_nents +
+		     (mapped_dst_nents > 1 ? mapped_dst_nents : 0);
+	sg_table = &edesc->sgt[0];
+	qm_sg_bytes = qm_sg_ents * sizeof(*sg_table);
+
+	ivsize = crypto_aead_ivsize(tls);
+	iv = (u8 *)(sg_table + qm_sg_ents);
+	/* Make sure IV is located in a DMAable area */
+	memcpy(iv, req->iv, ivsize);
+	iv_dma = dma_map_single(dev, iv, ivsize, DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, iv_dma)) {
+		dev_err(dev, "unable to map IV\n");
+		caam_unmap(dev, req->src, dst, src_nents, dst_nents, 0, 0,
+		DMA_NONE, 0, 0);
+		qi_cache_free(edesc);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	edesc->src_nents = src_nents;
+	edesc->dst_nents = dst_nents;
+	edesc->dst = dst;
+	edesc->iv_dma = iv_dma;
+
+	dma_to_qm_sg_one(sg_table, iv_dma, ivsize, 0);
+	qm_sg_index = 1;
+
+	sg_to_qm_sg_last(req->src, mapped_src_nents, sg_table + qm_sg_index, 0);
+	qm_sg_index += mapped_src_nents;
+
+	if (mapped_dst_nents > 1)
+		sg_to_qm_sg_last(dst, mapped_dst_nents, sg_table +
+				 qm_sg_index, 0);
+
+	qm_sg_dma = dma_map_single(dev, sg_table, qm_sg_bytes, DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, qm_sg_dma)) {
+		dev_err(dev, "unable to map S/G table\n");
+		caam_unmap(dev, req->src, dst, src_nents, dst_nents, iv_dma,
+			   ivsize, DMA_TO_DEVICE, 0, 0);
+		qi_cache_free(edesc);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	edesc->qm_sg_dma = qm_sg_dma;
+	edesc->qm_sg_bytes = qm_sg_bytes;
+
+	out_len = req->cryptlen + (encrypt ? authsize : 0);
+	in_len = ivsize + req->assoclen + req->cryptlen;
+
+	memset(&req_ctx->fd_flt, 0, sizeof(req_ctx->fd_flt));
+	dpaa2_fl_set_final(in_fle, true);
+	dpaa2_fl_set_format(in_fle, dpaa2_fl_sg);
+	dpaa2_fl_set_addr(in_fle, qm_sg_dma);
+	dpaa2_fl_set_len(in_fle, in_len);
+
+	if (req->dst == req->src) {
+		dpaa2_fl_set_format(out_fle, dpaa2_fl_sg);
+		dpaa2_fl_set_addr(out_fle, qm_sg_dma +
+				  (sg_nents_for_len(req->src, req->assoclen) +
+				   1) * sizeof(*sg_table));
+	} else if (mapped_dst_nents == 1) {
+		dpaa2_fl_set_format(out_fle, dpaa2_fl_single);
+		dpaa2_fl_set_addr(out_fle, sg_dma_address(dst));
+	} else {
+		dpaa2_fl_set_format(out_fle, dpaa2_fl_sg);
+		dpaa2_fl_set_addr(out_fle, qm_sg_dma + qm_sg_index *
+				  sizeof(*sg_table));
+	}
+
+	dpaa2_fl_set_len(out_fle, out_len);
+
+	return edesc;
+}
+
+static int tls_set_sh_desc(struct crypto_aead *tls)
+{
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+	unsigned int ivsize = crypto_aead_ivsize(tls);
+	unsigned int blocksize = crypto_aead_blocksize(tls);
+	struct device *dev = ctx->dev;
+	struct dpaa2_caam_priv *priv = dev_get_drvdata(dev);
+	struct caam_flc *flc;
+	u32 *desc;
+	unsigned int assoclen = 13; /* always 13 bytes for TLS */
+	unsigned int data_len[2];
+	u32 inl_mask;
+
+	if (!ctx->cdata.keylen || !ctx->authsize)
+		return 0;
+
+	/*
+	 * TLS 1.0 encrypt shared descriptor
+	 * Job Descriptor and Shared Descriptor
+	 * must fit into the 64-word Descriptor h/w Buffer
+	 */
+	data_len[0] = ctx->adata.keylen_pad;
+	data_len[1] = ctx->cdata.keylen;
+
+	if (desc_inline_query(DESC_TLS10_ENC_LEN, DESC_JOB_IO_LEN, data_len,
+			      &inl_mask, ARRAY_SIZE(data_len)) < 0)
+		return -EINVAL;
+
+	if (inl_mask & 1)
+		ctx->adata.key_virt = ctx->key;
+	else
+		ctx->adata.key_dma = ctx->key_dma;
+
+	if (inl_mask & 2)
+		ctx->cdata.key_virt = ctx->key + ctx->adata.keylen_pad;
+	else
+		ctx->cdata.key_dma = ctx->key_dma + ctx->adata.keylen_pad;
+
+	ctx->adata.key_inline = !!(inl_mask & 1);
+	ctx->cdata.key_inline = !!(inl_mask & 2);
+
+	flc = &ctx->flc[ENCRYPT];
+	desc = flc->sh_desc;
+	cnstr_shdsc_tls_encap(desc, &ctx->cdata, &ctx->adata,
+			      assoclen, ivsize, ctx->authsize, blocksize,
+			      priv->sec_attr.era);
+	flc->flc[1] = cpu_to_caam32(desc_len(desc));
+	dma_sync_single_for_device(dev, ctx->flc_dma[ENCRYPT],
+				   sizeof(flc->flc) + desc_bytes(desc),
+				   ctx->dir);
+
+	/*
+	 * TLS 1.0 decrypt shared descriptor
+	 * Keys do not fit inline, regardless of algorithms used
+	 */
+	ctx->adata.key_inline = false;
+	ctx->adata.key_dma = ctx->key_dma;
+	ctx->cdata.key_dma = ctx->key_dma + ctx->adata.keylen_pad;
+
+	flc = &ctx->flc[DECRYPT];
+	desc = flc->sh_desc;
+	cnstr_shdsc_tls_decap(desc, &ctx->cdata, &ctx->adata, assoclen, ivsize,
+			      ctx->authsize, blocksize, priv->sec_attr.era);
+	flc->flc[1] = cpu_to_caam32(desc_len(desc));
+	dma_sync_single_for_device(dev, ctx->flc_dma[DECRYPT],
+				   sizeof(flc->flc) + desc_bytes(desc),
+				   ctx->dir);
+
+	return 0;
 }
 
 static int chachapoly_set_sh_desc(struct crypto_aead *aead)
@@ -615,6 +890,61 @@ static int chachapoly_setauthsize(struct crypto_aead *aead,
 
 	ctx->authsize = authsize;
 	return chachapoly_set_sh_desc(aead);
+}
+
+static int tls_setkey(struct crypto_aead *tls, const u8 *key,
+		      unsigned int keylen)
+{
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+	struct device *dev = ctx->dev;
+	struct crypto_authenc_keys keys;
+
+	if (crypto_authenc_extractkeys(&keys, key, keylen) != 0)
+		goto badkey;
+
+#ifdef DEBUG
+	dev_err(dev, "keylen %d enckeylen %d authkeylen %d\n",
+		keys.authkeylen + keys.enckeylen, keys.enckeylen,
+		keys.authkeylen);
+	print_hex_dump(KERN_ERR, "key in @" __stringify(__LINE__)": ",
+		       DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
+#endif
+
+	ctx->adata.keylen = keys.authkeylen;
+	ctx->adata.keylen_pad = split_key_len(ctx->adata.algtype &
+					      OP_ALG_ALGSEL_MASK);
+
+	if (ctx->adata.keylen_pad + keys.enckeylen > CAAM_MAX_KEY_SIZE)
+		goto badkey;
+
+	memcpy(ctx->key, keys.authkey, keys.authkeylen);
+	memcpy(ctx->key + ctx->adata.keylen_pad, keys.enckey, keys.enckeylen);
+	dma_sync_single_for_device(dev, ctx->key_dma, ctx->adata.keylen_pad +
+				   keys.enckeylen, ctx->dir);
+#ifdef DEBUG
+	print_hex_dump(KERN_ERR, "ctx.key@" __stringify(__LINE__)": ",
+		       DUMP_PREFIX_ADDRESS, 16, 4, ctx->key,
+		       ctx->adata.keylen_pad + keys.enckeylen, 1);
+#endif
+
+	ctx->cdata.keylen = keys.enckeylen;
+
+	memzero_explicit(&keys, sizeof(keys));
+	return tls_set_sh_desc(tls);
+badkey:
+	crypto_aead_set_flags(tls, CRYPTO_TFM_RES_BAD_KEY_LEN);
+	memzero_explicit(&keys, sizeof(keys));
+	return -EINVAL;
+}
+
+static int tls_setauthsize(struct crypto_aead *tls, unsigned int authsize)
+{
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+
+	ctx->authsize = authsize;
+	tls_set_sh_desc(tls);
+
+	return 0;
 }
 
 static int chachapoly_setkey(struct crypto_aead *aead, const u8 *key,
@@ -1077,14 +1407,26 @@ static struct skcipher_edesc *skcipher_edesc_alloc(struct skcipher_request *req)
 	qm_sg_ents = 1 + mapped_src_nents;
 	dst_sg_idx = qm_sg_ents;
 
-	qm_sg_ents += mapped_dst_nents > 1 ? mapped_dst_nents : 0;
+	/*
+	 * Input, output HW S/G tables: [IV, src][dst, IV]
+	 * IV entries point to the same buffer
+	 * If src == dst, S/G entries are reused (S/G tables overlap)
+	 *
+	 * HW reads 4 S/G entries at a time; make sure the reads don't go beyond
+	 * the end of the table by allocating more S/G entries.
+	 */
+	if (req->src != req->dst)
+		qm_sg_ents += pad_sg_nents(mapped_dst_nents + 1);
+	else
+		qm_sg_ents = 1 + pad_sg_nents(qm_sg_ents);
+
 	qm_sg_bytes = qm_sg_ents * sizeof(struct dpaa2_sg_entry);
 	if (unlikely(offsetof(struct skcipher_edesc, sgt) + qm_sg_bytes +
 		     ivsize > CAAM_QI_MEMCACHE_SIZE)) {
 		dev_err(dev, "No space for %d S/G entries and/or %dB IV\n",
 			qm_sg_ents, ivsize);
 		caam_unmap(dev, req->src, req->dst, src_nents, dst_nents, 0,
-			   0, 0, 0);
+			   0, DMA_NONE, 0, 0);
 		return ERR_PTR(-ENOMEM);
 	}
 
@@ -1093,7 +1435,7 @@ static struct skcipher_edesc *skcipher_edesc_alloc(struct skcipher_request *req)
 	if (unlikely(!edesc)) {
 		dev_err(dev, "could not allocate extended descriptor\n");
 		caam_unmap(dev, req->src, req->dst, src_nents, dst_nents, 0,
-			   0, 0, 0);
+			   0, DMA_NONE, 0, 0);
 		return ERR_PTR(-ENOMEM);
 	}
 
@@ -1102,11 +1444,11 @@ static struct skcipher_edesc *skcipher_edesc_alloc(struct skcipher_request *req)
 	iv = (u8 *)(sg_table + qm_sg_ents);
 	memcpy(iv, req->iv, ivsize);
 
-	iv_dma = dma_map_single(dev, iv, ivsize, DMA_TO_DEVICE);
+	iv_dma = dma_map_single(dev, iv, ivsize, DMA_BIDIRECTIONAL);
 	if (dma_mapping_error(dev, iv_dma)) {
 		dev_err(dev, "unable to map IV\n");
 		caam_unmap(dev, req->src, req->dst, src_nents, dst_nents, 0,
-			   0, 0, 0);
+			   0, DMA_NONE, 0, 0);
 		qi_cache_free(edesc);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -1117,18 +1459,20 @@ static struct skcipher_edesc *skcipher_edesc_alloc(struct skcipher_request *req)
 	edesc->qm_sg_bytes = qm_sg_bytes;
 
 	dma_to_qm_sg_one(sg_table, iv_dma, ivsize, 0);
-	sg_to_qm_sg_last(req->src, mapped_src_nents, sg_table + 1, 0);
+	sg_to_qm_sg(req->src, req->cryptlen, sg_table + 1, 0);
 
-	if (mapped_dst_nents > 1)
-		sg_to_qm_sg_last(req->dst, mapped_dst_nents, sg_table +
-				 dst_sg_idx, 0);
+	if (req->src != req->dst)
+		sg_to_qm_sg(req->dst, req->cryptlen, sg_table + dst_sg_idx, 0);
+
+	dma_to_qm_sg_one(sg_table + dst_sg_idx + mapped_dst_nents, iv_dma,
+			 ivsize, 0);
 
 	edesc->qm_sg_dma = dma_map_single(dev, sg_table, edesc->qm_sg_bytes,
 					  DMA_TO_DEVICE);
 	if (dma_mapping_error(dev, edesc->qm_sg_dma)) {
 		dev_err(dev, "unable to map S/G table\n");
 		caam_unmap(dev, req->src, req->dst, src_nents, dst_nents,
-			   iv_dma, ivsize, 0, 0);
+			   iv_dma, ivsize, DMA_BIDIRECTIONAL, 0, 0);
 		qi_cache_free(edesc);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -1136,23 +1480,19 @@ static struct skcipher_edesc *skcipher_edesc_alloc(struct skcipher_request *req)
 	memset(&req_ctx->fd_flt, 0, sizeof(req_ctx->fd_flt));
 	dpaa2_fl_set_final(in_fle, true);
 	dpaa2_fl_set_len(in_fle, req->cryptlen + ivsize);
-	dpaa2_fl_set_len(out_fle, req->cryptlen);
+	dpaa2_fl_set_len(out_fle, req->cryptlen + ivsize);
 
 	dpaa2_fl_set_format(in_fle, dpaa2_fl_sg);
 	dpaa2_fl_set_addr(in_fle, edesc->qm_sg_dma);
 
-	if (req->src == req->dst) {
-		dpaa2_fl_set_format(out_fle, dpaa2_fl_sg);
+	dpaa2_fl_set_format(out_fle, dpaa2_fl_sg);
+
+	if (req->src == req->dst)
 		dpaa2_fl_set_addr(out_fle, edesc->qm_sg_dma +
 				  sizeof(*sg_table));
-	} else if (mapped_dst_nents > 1) {
-		dpaa2_fl_set_format(out_fle, dpaa2_fl_sg);
+	else
 		dpaa2_fl_set_addr(out_fle, edesc->qm_sg_dma + dst_sg_idx *
 				  sizeof(*sg_table));
-	} else {
-		dpaa2_fl_set_format(out_fle, dpaa2_fl_single);
-		dpaa2_fl_set_addr(out_fle, sg_dma_address(req->dst));
-	}
 
 	return edesc;
 }
@@ -1164,8 +1504,20 @@ static void aead_unmap(struct device *dev, struct aead_edesc *edesc,
 	int ivsize = crypto_aead_ivsize(aead);
 
 	caam_unmap(dev, req->src, req->dst, edesc->src_nents, edesc->dst_nents,
-		   edesc->iv_dma, ivsize, edesc->qm_sg_dma, edesc->qm_sg_bytes);
+		   edesc->iv_dma, ivsize, DMA_TO_DEVICE, edesc->qm_sg_dma,
+		   edesc->qm_sg_bytes);
 	dma_unmap_single(dev, edesc->assoclen_dma, 4, DMA_TO_DEVICE);
+}
+
+static void tls_unmap(struct device *dev, struct tls_edesc *edesc,
+		      struct aead_request *req)
+{
+	struct crypto_aead *tls = crypto_aead_reqtfm(req);
+	int ivsize = crypto_aead_ivsize(tls);
+
+	caam_unmap(dev, req->src, edesc->dst, edesc->src_nents,
+		   edesc->dst_nents, edesc->iv_dma, ivsize, DMA_TO_DEVICE,
+		   edesc->qm_sg_dma, edesc->qm_sg_bytes);
 }
 
 static void skcipher_unmap(struct device *dev, struct skcipher_edesc *edesc,
@@ -1175,7 +1527,8 @@ static void skcipher_unmap(struct device *dev, struct skcipher_edesc *edesc,
 	int ivsize = crypto_skcipher_ivsize(skcipher);
 
 	caam_unmap(dev, req->src, req->dst, edesc->src_nents, edesc->dst_nents,
-		   edesc->iv_dma, ivsize, edesc->qm_sg_dma, edesc->qm_sg_bytes);
+		   edesc->iv_dma, ivsize, DMA_BIDIRECTIONAL, edesc->qm_sg_dma,
+		   edesc->qm_sg_bytes);
 }
 
 static void aead_encrypt_done(void *cbk_ctx, u32 status)
@@ -1287,6 +1640,119 @@ static int aead_decrypt(struct aead_request *req)
 	return ret;
 }
 
+static void tls_encrypt_done(void *cbk_ctx, u32 status)
+{
+	struct crypto_async_request *areq = cbk_ctx;
+	struct aead_request *req = container_of(areq, struct aead_request,
+						base);
+	struct caam_request *req_ctx = to_caam_req(areq);
+	struct tls_edesc *edesc = req_ctx->edesc;
+	struct crypto_aead *tls = crypto_aead_reqtfm(req);
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+	int ecode = 0;
+
+#ifdef DEBUG
+	dev_err(ctx->dev, "%s %d: err 0x%x\n", __func__, __LINE__, status);
+#endif
+
+	if (unlikely(status)) {
+		caam_qi2_strstatus(ctx->dev, status);
+		ecode = -EIO;
+	}
+
+	tls_unmap(ctx->dev, edesc, req);
+	qi_cache_free(edesc);
+	aead_request_complete(req, ecode);
+}
+
+static void tls_decrypt_done(void *cbk_ctx, u32 status)
+{
+	struct crypto_async_request *areq = cbk_ctx;
+	struct aead_request *req = container_of(areq, struct aead_request,
+						base);
+	struct caam_request *req_ctx = to_caam_req(areq);
+	struct tls_edesc *edesc = req_ctx->edesc;
+	struct crypto_aead *tls = crypto_aead_reqtfm(req);
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+	int ecode = 0;
+
+#ifdef DEBUG
+	dev_err(ctx->dev, "%s %d: err 0x%x\n", __func__, __LINE__, status);
+#endif
+
+	if (unlikely(status)) {
+		caam_qi2_strstatus(ctx->dev, status);
+		/*
+		 * verify hw auth check passed else return -EBADMSG
+		 */
+		if ((status & JRSTA_CCBERR_ERRID_MASK) ==
+		     JRSTA_CCBERR_ERRID_ICVCHK)
+			ecode = -EBADMSG;
+		else
+			ecode = -EIO;
+	}
+
+	tls_unmap(ctx->dev, edesc, req);
+	qi_cache_free(edesc);
+	aead_request_complete(req, ecode);
+}
+
+static int tls_encrypt(struct aead_request *req)
+{
+	struct tls_edesc *edesc;
+	struct crypto_aead *tls = crypto_aead_reqtfm(req);
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+	struct caam_request *caam_req = aead_request_ctx(req);
+	int ret;
+
+	/* allocate extended descriptor */
+	edesc = tls_edesc_alloc(req, true);
+	if (IS_ERR(edesc))
+		return PTR_ERR(edesc);
+
+	caam_req->flc = &ctx->flc[ENCRYPT];
+	caam_req->flc_dma = ctx->flc_dma[ENCRYPT];
+	caam_req->cbk = tls_encrypt_done;
+	caam_req->ctx = &req->base;
+	caam_req->edesc = edesc;
+	ret = dpaa2_caam_enqueue(ctx->dev, caam_req);
+	if (ret != -EINPROGRESS &&
+	    !(ret == -EBUSY && req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG)) {
+		tls_unmap(ctx->dev, edesc, req);
+		qi_cache_free(edesc);
+	}
+
+	return ret;
+}
+
+static int tls_decrypt(struct aead_request *req)
+{
+	struct tls_edesc *edesc;
+	struct crypto_aead *tls = crypto_aead_reqtfm(req);
+	struct caam_ctx *ctx = crypto_aead_ctx(tls);
+	struct caam_request *caam_req = aead_request_ctx(req);
+	int ret;
+
+	/* allocate extended descriptor */
+	edesc = tls_edesc_alloc(req, false);
+	if (IS_ERR(edesc))
+		return PTR_ERR(edesc);
+
+	caam_req->flc = &ctx->flc[DECRYPT];
+	caam_req->flc_dma = ctx->flc_dma[DECRYPT];
+	caam_req->cbk = tls_decrypt_done;
+	caam_req->ctx = &req->base;
+	caam_req->edesc = edesc;
+	ret = dpaa2_caam_enqueue(ctx->dev, caam_req);
+	if (ret != -EINPROGRESS &&
+	    !(ret == -EBUSY && req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG)) {
+		tls_unmap(ctx->dev, edesc, req);
+		qi_cache_free(edesc);
+	}
+
+	return ret;
+}
+
 static int ipsec_gcm_encrypt(struct aead_request *req)
 {
 	if (req->assoclen < 8)
@@ -1324,7 +1790,7 @@ static void skcipher_encrypt_done(void *cbk_ctx, u32 status)
 	print_hex_dump_debug("dstiv  @" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, req->iv,
 			     edesc->src_nents > 1 ? 100 : ivsize, 1);
-	caam_dump_sg(KERN_DEBUG, "dst    @" __stringify(__LINE__)": ",
+	caam_dump_sg("dst    @" __stringify(__LINE__)": ",
 		     DUMP_PREFIX_ADDRESS, 16, 4, req->dst,
 		     edesc->dst_nents > 1 ? 100 : req->cryptlen, 1);
 
@@ -1332,10 +1798,10 @@ static void skcipher_encrypt_done(void *cbk_ctx, u32 status)
 
 	/*
 	 * The crypto API expects us to set the IV (req->iv) to the last
-	 * ciphertext block. This is used e.g. by the CTS mode.
+	 * ciphertext block (CBC mode) or last counter (CTR mode).
+	 * This is used e.g. by the CTS mode.
 	 */
-	scatterwalk_map_and_copy(req->iv, req->dst, req->cryptlen - ivsize,
-				 ivsize, 0);
+	memcpy(req->iv, (u8 *)&edesc->sgt[0] + edesc->qm_sg_bytes, ivsize);
 
 	qi_cache_free(edesc);
 	skcipher_request_complete(req, ecode);
@@ -1362,11 +1828,19 @@ static void skcipher_decrypt_done(void *cbk_ctx, u32 status)
 	print_hex_dump_debug("dstiv  @" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, req->iv,
 			     edesc->src_nents > 1 ? 100 : ivsize, 1);
-	caam_dump_sg(KERN_DEBUG, "dst    @" __stringify(__LINE__)": ",
+	caam_dump_sg("dst    @" __stringify(__LINE__)": ",
 		     DUMP_PREFIX_ADDRESS, 16, 4, req->dst,
 		     edesc->dst_nents > 1 ? 100 : req->cryptlen, 1);
 
 	skcipher_unmap(ctx->dev, edesc, req);
+
+	/*
+	 * The crypto API expects us to set the IV (req->iv) to the last
+	 * ciphertext block (CBC mode) or last counter (CTR mode).
+	 * This is used e.g. by the CTS mode.
+	 */
+	memcpy(req->iv, (u8 *)&edesc->sgt[0] + edesc->qm_sg_bytes, ivsize);
+
 	qi_cache_free(edesc);
 	skcipher_request_complete(req, ecode);
 }
@@ -1405,20 +1879,12 @@ static int skcipher_decrypt(struct skcipher_request *req)
 	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
 	struct caam_ctx *ctx = crypto_skcipher_ctx(skcipher);
 	struct caam_request *caam_req = skcipher_request_ctx(req);
-	int ivsize = crypto_skcipher_ivsize(skcipher);
 	int ret;
 
 	/* allocate extended descriptor */
 	edesc = skcipher_edesc_alloc(req);
 	if (IS_ERR(edesc))
 		return PTR_ERR(edesc);
-
-	/*
-	 * The crypto API expects us to set the IV (req->iv) to the last
-	 * ciphertext block.
-	 */
-	scatterwalk_map_and_copy(req->iv, req->src, req->cryptlen - ivsize,
-				 ivsize, 0);
 
 	caam_req->flc = &ctx->flc[DECRYPT];
 	caam_req->flc_dma = ctx->flc_dma[DECRYPT];
@@ -2834,6 +3300,26 @@ static struct caam_aead_alg driver_aeads[] = {
 			.geniv = true,
 		},
 	},
+	{
+		.aead = {
+			.base = {
+				.cra_name = "tls10(hmac(sha1),cbc(aes))",
+				.cra_driver_name = "tls10-hmac-sha1-cbc-aes-caam-qi2",
+				.cra_blocksize = AES_BLOCK_SIZE,
+			},
+			.setkey = tls_setkey,
+			.setauthsize = tls_setauthsize,
+			.encrypt = tls_encrypt,
+			.decrypt = tls_decrypt,
+			.ivsize = AES_BLOCK_SIZE,
+			.maxauthsize = SHA1_DIGEST_SIZE,
+		},
+		.caam = {
+			.class1_alg_type = OP_ALG_ALGSEL_AES | OP_ALG_AAI_CBC,
+			.class2_alg_type = OP_ALG_ALGSEL_SHA1 |
+					   OP_ALG_AAI_HMAC_PRECOMP,
+		},
+	},
 };
 
 static void caam_skcipher_alg_init(struct caam_skcipher_alg *t_alg)
@@ -3380,9 +3866,9 @@ static int ahash_update_ctx(struct ahash_request *req)
 
 	if (to_hash) {
 		struct dpaa2_sg_entry *sg_table;
+		int src_len = req->nbytes - *next_buflen;
 
-		src_nents = sg_nents_for_len(req->src,
-					     req->nbytes - (*next_buflen));
+		src_nents = sg_nents_for_len(req->src, src_len);
 		if (src_nents < 0) {
 			dev_err(ctx->dev, "Invalid number of src SG.\n");
 			return src_nents;
@@ -3409,7 +3895,7 @@ static int ahash_update_ctx(struct ahash_request *req)
 
 		edesc->src_nents = src_nents;
 		qm_sg_src_index = 1 + (*buflen ? 1 : 0);
-		qm_sg_bytes = (qm_sg_src_index + mapped_nents) *
+		qm_sg_bytes = pad_sg_nents(qm_sg_src_index + mapped_nents) *
 			      sizeof(*sg_table);
 		sg_table = &edesc->sgt[0];
 
@@ -3423,7 +3909,7 @@ static int ahash_update_ctx(struct ahash_request *req)
 			goto unmap_ctx;
 
 		if (mapped_nents) {
-			sg_to_qm_sg_last(req->src, mapped_nents,
+			sg_to_qm_sg_last(req->src, src_len,
 					 sg_table + qm_sg_src_index, 0);
 			if (*next_buflen)
 				scatterwalk_map_and_copy(next_buf, req->src,
@@ -3494,7 +3980,7 @@ static int ahash_final_ctx(struct ahash_request *req)
 	gfp_t flags = (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) ?
 		      GFP_KERNEL : GFP_ATOMIC;
 	int buflen = *current_buflen(state);
-	int qm_sg_bytes, qm_sg_src_index;
+	int qm_sg_bytes;
 	int digestsize = crypto_ahash_digestsize(ahash);
 	struct ahash_edesc *edesc;
 	struct dpaa2_sg_entry *sg_table;
@@ -3505,8 +3991,7 @@ static int ahash_final_ctx(struct ahash_request *req)
 	if (!edesc)
 		return -ENOMEM;
 
-	qm_sg_src_index = 1 + (buflen ? 1 : 0);
-	qm_sg_bytes = qm_sg_src_index * sizeof(*sg_table);
+	qm_sg_bytes = pad_sg_nents(1 + (buflen ? 1 : 0)) * sizeof(*sg_table);
 	sg_table = &edesc->sgt[0];
 
 	ret = ctx_map_to_qm_sg(ctx->dev, state, ctx->ctx_len, sg_table,
@@ -3518,7 +4003,7 @@ static int ahash_final_ctx(struct ahash_request *req)
 	if (ret)
 		goto unmap_ctx;
 
-	dpaa2_sg_set_final(sg_table + qm_sg_src_index - 1, true);
+	dpaa2_sg_set_final(sg_table + (buflen ? 1 : 0), true);
 
 	edesc->qm_sg_dma = dma_map_single(ctx->dev, sg_table, qm_sg_bytes,
 					  DMA_TO_DEVICE);
@@ -3599,7 +4084,8 @@ static int ahash_finup_ctx(struct ahash_request *req)
 
 	edesc->src_nents = src_nents;
 	qm_sg_src_index = 1 + (buflen ? 1 : 0);
-	qm_sg_bytes = (qm_sg_src_index + mapped_nents) * sizeof(*sg_table);
+	qm_sg_bytes = pad_sg_nents(qm_sg_src_index + mapped_nents) *
+		      sizeof(*sg_table);
 	sg_table = &edesc->sgt[0];
 
 	ret = ctx_map_to_qm_sg(ctx->dev, state, ctx->ctx_len, sg_table,
@@ -3611,7 +4097,7 @@ static int ahash_finup_ctx(struct ahash_request *req)
 	if (ret)
 		goto unmap_ctx;
 
-	sg_to_qm_sg_last(req->src, mapped_nents, sg_table + qm_sg_src_index, 0);
+	sg_to_qm_sg_last(req->src, req->nbytes, sg_table + qm_sg_src_index, 0);
 
 	edesc->qm_sg_dma = dma_map_single(ctx->dev, sg_table, qm_sg_bytes,
 					  DMA_TO_DEVICE);
@@ -3696,8 +4182,8 @@ static int ahash_digest(struct ahash_request *req)
 		int qm_sg_bytes;
 		struct dpaa2_sg_entry *sg_table = &edesc->sgt[0];
 
-		qm_sg_bytes = mapped_nents * sizeof(*sg_table);
-		sg_to_qm_sg_last(req->src, mapped_nents, sg_table, 0);
+		qm_sg_bytes = pad_sg_nents(mapped_nents) * sizeof(*sg_table);
+		sg_to_qm_sg_last(req->src, req->nbytes, sg_table, 0);
 		edesc->qm_sg_dma = dma_map_single(ctx->dev, sg_table,
 						  qm_sg_bytes, DMA_TO_DEVICE);
 		if (dma_mapping_error(ctx->dev, edesc->qm_sg_dma)) {
@@ -3840,9 +4326,9 @@ static int ahash_update_no_ctx(struct ahash_request *req)
 
 	if (to_hash) {
 		struct dpaa2_sg_entry *sg_table;
+		int src_len = req->nbytes - *next_buflen;
 
-		src_nents = sg_nents_for_len(req->src,
-					     req->nbytes - *next_buflen);
+		src_nents = sg_nents_for_len(req->src, src_len);
 		if (src_nents < 0) {
 			dev_err(ctx->dev, "Invalid number of src SG.\n");
 			return src_nents;
@@ -3868,14 +4354,15 @@ static int ahash_update_no_ctx(struct ahash_request *req)
 		}
 
 		edesc->src_nents = src_nents;
-		qm_sg_bytes = (1 + mapped_nents) * sizeof(*sg_table);
+		qm_sg_bytes = pad_sg_nents(1 + mapped_nents) *
+			      sizeof(*sg_table);
 		sg_table = &edesc->sgt[0];
 
 		ret = buf_map_to_qm_sg(ctx->dev, sg_table, state);
 		if (ret)
 			goto unmap_ctx;
 
-		sg_to_qm_sg_last(req->src, mapped_nents, sg_table + 1, 0);
+		sg_to_qm_sg_last(req->src, src_len, sg_table + 1, 0);
 
 		if (*next_buflen)
 			scatterwalk_map_and_copy(next_buf, req->src,
@@ -3987,14 +4474,14 @@ static int ahash_finup_no_ctx(struct ahash_request *req)
 	}
 
 	edesc->src_nents = src_nents;
-	qm_sg_bytes = (2 + mapped_nents) * sizeof(*sg_table);
+	qm_sg_bytes = pad_sg_nents(2 + mapped_nents) * sizeof(*sg_table);
 	sg_table = &edesc->sgt[0];
 
 	ret = buf_map_to_qm_sg(ctx->dev, sg_table, state);
 	if (ret)
 		goto unmap;
 
-	sg_to_qm_sg_last(req->src, mapped_nents, sg_table + 1, 0);
+	sg_to_qm_sg_last(req->src, req->nbytes, sg_table + 1, 0);
 
 	edesc->qm_sg_dma = dma_map_single(ctx->dev, sg_table, qm_sg_bytes,
 					  DMA_TO_DEVICE);
@@ -4064,9 +4551,9 @@ static int ahash_update_first(struct ahash_request *req)
 
 	if (to_hash) {
 		struct dpaa2_sg_entry *sg_table;
+		int src_len = req->nbytes - *next_buflen;
 
-		src_nents = sg_nents_for_len(req->src,
-					     req->nbytes - (*next_buflen));
+		src_nents = sg_nents_for_len(req->src, src_len);
 		if (src_nents < 0) {
 			dev_err(ctx->dev, "Invalid number of src SG.\n");
 			return src_nents;
@@ -4101,8 +4588,9 @@ static int ahash_update_first(struct ahash_request *req)
 		if (mapped_nents > 1) {
 			int qm_sg_bytes;
 
-			sg_to_qm_sg_last(req->src, mapped_nents, sg_table, 0);
-			qm_sg_bytes = mapped_nents * sizeof(*sg_table);
+			sg_to_qm_sg_last(req->src, src_len, sg_table, 0);
+			qm_sg_bytes = pad_sg_nents(mapped_nents) *
+				      sizeof(*sg_table);
 			edesc->qm_sg_dma = dma_map_single(ctx->dev, sg_table,
 							  qm_sg_bytes,
 							  DMA_TO_DEVICE);

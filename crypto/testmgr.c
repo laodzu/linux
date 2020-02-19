@@ -111,6 +111,13 @@ struct drbg_test_suite {
 	unsigned int count;
 };
 
+struct tls_test_suite {
+	struct {
+		struct tls_testvec *vecs;
+		unsigned int count;
+	} enc, dec;
+};
+
 struct akcipher_test_suite {
 	const struct akcipher_testvec *vecs;
 	unsigned int count;
@@ -135,6 +142,7 @@ struct alg_test_desc {
 		struct hash_test_suite hash;
 		struct cprng_test_suite cprng;
 		struct drbg_test_suite drbg;
+		struct tls_test_suite tls;
 		struct akcipher_test_suite akcipher;
 		struct kpp_test_suite kpp;
 	} suite;
@@ -1032,6 +1040,205 @@ static void crypto_reenable_simd_for_test(void)
 }
 #endif /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
 
+static int build_hash_sglist(struct test_sglist *tsgl,
+			     const struct hash_testvec *vec,
+			     const struct testvec_config *cfg,
+			     unsigned int alignmask,
+			     const struct test_sg_division *divs[XBUFSIZE])
+{
+	struct kvec kv;
+	struct iov_iter input;
+
+	kv.iov_base = (void *)vec->plaintext;
+	kv.iov_len = vec->psize;
+	iov_iter_kvec(&input, WRITE, &kv, 1, vec->psize);
+	return build_test_sglist(tsgl, cfg->src_divs, alignmask, vec->psize,
+				 &input, divs);
+}
+
+static int check_hash_result(const char *type,
+			     const u8 *result, unsigned int digestsize,
+			     const struct hash_testvec *vec,
+			     const char *vec_name,
+			     const char *driver,
+			     const struct testvec_config *cfg)
+{
+	if (memcmp(result, vec->digest, digestsize) != 0) {
+		pr_err("alg: %s: %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
+		       type, driver, vec_name, cfg->name);
+		return -EINVAL;
+	}
+	if (!testmgr_is_poison(&result[digestsize], TESTMGR_POISON_LEN)) {
+		pr_err("alg: %s: %s overran result buffer on test vector %s, cfg=\"%s\"\n",
+		       type, driver, vec_name, cfg->name);
+		return -EOVERFLOW;
+	}
+	return 0;
+}
+
+static inline int check_shash_op(const char *op, int err,
+				 const char *driver, const char *vec_name,
+				 const struct testvec_config *cfg)
+{
+	if (err)
+		pr_err("alg: shash: %s %s() failed with err %d on test vector %s, cfg=\"%s\"\n",
+		       driver, op, err, vec_name, cfg->name);
+	return err;
+}
+
+static inline const void *sg_data(struct scatterlist *sg)
+{
+	return page_address(sg_page(sg)) + sg->offset;
+}
+
+/* Test one hash test vector in one configuration, using the shash API */
+static int test_shash_vec_cfg(const char *driver,
+			      const struct hash_testvec *vec,
+			      const char *vec_name,
+			      const struct testvec_config *cfg,
+			      struct shash_desc *desc,
+			      struct test_sglist *tsgl,
+			      u8 *hashstate)
+{
+	struct crypto_shash *tfm = desc->tfm;
+	const unsigned int alignmask = crypto_shash_alignmask(tfm);
+	const unsigned int digestsize = crypto_shash_digestsize(tfm);
+	const unsigned int statesize = crypto_shash_statesize(tfm);
+	const struct test_sg_division *divs[XBUFSIZE];
+	unsigned int i;
+	u8 result[HASH_MAX_DIGESTSIZE + TESTMGR_POISON_LEN];
+	int err;
+
+	/* Set the key, if specified */
+	if (vec->ksize) {
+		err = crypto_shash_setkey(tfm, vec->key, vec->ksize);
+		if (err) {
+			if (err == vec->setkey_error)
+				return 0;
+			pr_err("alg: shash: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
+			       driver, vec_name, vec->setkey_error, err,
+			       crypto_shash_get_flags(tfm));
+			return err;
+		}
+		if (vec->setkey_error) {
+			pr_err("alg: shash: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
+			       driver, vec_name, vec->setkey_error);
+			return -EINVAL;
+		}
+	}
+
+	/* Build the scatterlist for the source data */
+	err = build_hash_sglist(tsgl, vec, cfg, alignmask, divs);
+	if (err) {
+		pr_err("alg: shash: %s: error preparing scatterlist for test vector %s, cfg=\"%s\"\n",
+		       driver, vec_name, cfg->name);
+		return err;
+	}
+
+	/* Do the actual hashing */
+
+	testmgr_poison(desc->__ctx, crypto_shash_descsize(tfm));
+	testmgr_poison(result, digestsize + TESTMGR_POISON_LEN);
+
+	if (cfg->finalization_type == FINALIZATION_TYPE_DIGEST ||
+	    vec->digest_error) {
+		/* Just using digest() */
+		if (tsgl->nents != 1)
+			return 0;
+		if (cfg->nosimd)
+			crypto_disable_simd_for_test();
+		err = crypto_shash_digest(desc, sg_data(&tsgl->sgl[0]),
+					  tsgl->sgl[0].length, result);
+		if (cfg->nosimd)
+			crypto_reenable_simd_for_test();
+		if (err) {
+			if (err == vec->digest_error)
+				return 0;
+			pr_err("alg: shash: %s digest() failed on test vector %s; expected_error=%d, actual_error=%d, cfg=\"%s\"\n",
+			       driver, vec_name, vec->digest_error, err,
+			       cfg->name);
+			return err;
+		}
+		if (vec->digest_error) {
+			pr_err("alg: shash: %s digest() unexpectedly succeeded on test vector %s; expected_error=%d, cfg=\"%s\"\n",
+			       driver, vec_name, vec->digest_error, cfg->name);
+			return -EINVAL;
+		}
+		goto result_ready;
+	}
+
+	/* Using init(), zero or more update(), then final() or finup() */
+
+	if (cfg->nosimd)
+		crypto_disable_simd_for_test();
+	err = crypto_shash_init(desc);
+	if (cfg->nosimd)
+		crypto_reenable_simd_for_test();
+	err = check_shash_op("init", err, driver, vec_name, cfg);
+	if (err)
+		return err;
+
+	for (i = 0; i < tsgl->nents; i++) {
+		if (i + 1 == tsgl->nents &&
+		    cfg->finalization_type == FINALIZATION_TYPE_FINUP) {
+			if (divs[i]->nosimd)
+				crypto_disable_simd_for_test();
+			err = crypto_shash_finup(desc, sg_data(&tsgl->sgl[i]),
+						 tsgl->sgl[i].length, result);
+			if (divs[i]->nosimd)
+				crypto_reenable_simd_for_test();
+			err = check_shash_op("finup", err, driver, vec_name,
+					     cfg);
+			if (err)
+				return err;
+			goto result_ready;
+		}
+		if (divs[i]->nosimd)
+			crypto_disable_simd_for_test();
+		err = crypto_shash_update(desc, sg_data(&tsgl->sgl[i]),
+					  tsgl->sgl[i].length);
+		if (divs[i]->nosimd)
+			crypto_reenable_simd_for_test();
+		err = check_shash_op("update", err, driver, vec_name, cfg);
+		if (err)
+			return err;
+		if (divs[i]->flush_type == FLUSH_TYPE_REIMPORT) {
+			/* Test ->export() and ->import() */
+			testmgr_poison(hashstate + statesize,
+				       TESTMGR_POISON_LEN);
+			err = crypto_shash_export(desc, hashstate);
+			err = check_shash_op("export", err, driver, vec_name,
+					     cfg);
+			if (err)
+				return err;
+			if (!testmgr_is_poison(hashstate + statesize,
+					       TESTMGR_POISON_LEN)) {
+				pr_err("alg: shash: %s export() overran state buffer on test vector %s, cfg=\"%s\"\n",
+				       driver, vec_name, cfg->name);
+				return -EOVERFLOW;
+			}
+			testmgr_poison(desc->__ctx, crypto_shash_descsize(tfm));
+			err = crypto_shash_import(desc, hashstate);
+			err = check_shash_op("import", err, driver, vec_name,
+					     cfg);
+			if (err)
+				return err;
+		}
+	}
+
+	if (cfg->nosimd)
+		crypto_disable_simd_for_test();
+	err = crypto_shash_final(desc, result);
+	if (cfg->nosimd)
+		crypto_reenable_simd_for_test();
+	err = check_shash_op("final", err, driver, vec_name, cfg);
+	if (err)
+		return err;
+result_ready:
+	return check_hash_result("shash", result, digestsize, vec, vec_name,
+				 driver, cfg);
+}
+
 static int do_ahash_op(int (*op)(struct ahash_request *req),
 		       struct ahash_request *req,
 		       struct crypto_wait *wait, bool nosimd)
@@ -1049,31 +1256,32 @@ static int do_ahash_op(int (*op)(struct ahash_request *req),
 	return crypto_wait_req(err, wait);
 }
 
-static int check_nonfinal_hash_op(const char *op, int err,
-				  u8 *result, unsigned int digestsize,
-				  const char *driver, const char *vec_name,
-				  const struct testvec_config *cfg)
+static int check_nonfinal_ahash_op(const char *op, int err,
+				   u8 *result, unsigned int digestsize,
+				   const char *driver, const char *vec_name,
+				   const struct testvec_config *cfg)
 {
 	if (err) {
-		pr_err("alg: hash: %s %s() failed with err %d on test vector %s, cfg=\"%s\"\n",
+		pr_err("alg: ahash: %s %s() failed with err %d on test vector %s, cfg=\"%s\"\n",
 		       driver, op, err, vec_name, cfg->name);
 		return err;
 	}
 	if (!testmgr_is_poison(result, digestsize)) {
-		pr_err("alg: hash: %s %s() used result buffer on test vector %s, cfg=\"%s\"\n",
+		pr_err("alg: ahash: %s %s() used result buffer on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
 		return -EINVAL;
 	}
 	return 0;
 }
 
-static int test_hash_vec_cfg(const char *driver,
-			     const struct hash_testvec *vec,
-			     const char *vec_name,
-			     const struct testvec_config *cfg,
-			     struct ahash_request *req,
-			     struct test_sglist *tsgl,
-			     u8 *hashstate)
+/* Test one hash test vector in one configuration, using the ahash API */
+static int test_ahash_vec_cfg(const char *driver,
+			      const struct hash_testvec *vec,
+			      const char *vec_name,
+			      const struct testvec_config *cfg,
+			      struct ahash_request *req,
+			      struct test_sglist *tsgl,
+			      u8 *hashstate)
 {
 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
 	const unsigned int alignmask = crypto_ahash_alignmask(tfm);
@@ -1082,8 +1290,6 @@ static int test_hash_vec_cfg(const char *driver,
 	const u32 req_flags = CRYPTO_TFM_REQ_MAY_BACKLOG | cfg->req_flags;
 	const struct test_sg_division *divs[XBUFSIZE];
 	DECLARE_CRYPTO_WAIT(wait);
-	struct kvec _input;
-	struct iov_iter input;
 	unsigned int i;
 	struct scatterlist *pending_sgl;
 	unsigned int pending_len;
@@ -1096,26 +1302,22 @@ static int test_hash_vec_cfg(const char *driver,
 		if (err) {
 			if (err == vec->setkey_error)
 				return 0;
-			pr_err("alg: hash: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
+			pr_err("alg: ahash: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
 			       driver, vec_name, vec->setkey_error, err,
 			       crypto_ahash_get_flags(tfm));
 			return err;
 		}
 		if (vec->setkey_error) {
-			pr_err("alg: hash: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
+			pr_err("alg: ahash: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
 			       driver, vec_name, vec->setkey_error);
 			return -EINVAL;
 		}
 	}
 
 	/* Build the scatterlist for the source data */
-	_input.iov_base = (void *)vec->plaintext;
-	_input.iov_len = vec->psize;
-	iov_iter_kvec(&input, WRITE, &_input, 1, vec->psize);
-	err = build_test_sglist(tsgl, cfg->src_divs, alignmask, vec->psize,
-				&input, divs);
+	err = build_hash_sglist(tsgl, vec, cfg, alignmask, divs);
 	if (err) {
-		pr_err("alg: hash: %s: error preparing scatterlist for test vector %s, cfg=\"%s\"\n",
+		pr_err("alg: ahash: %s: error preparing scatterlist for test vector %s, cfg=\"%s\"\n",
 		       driver, vec_name, cfg->name);
 		return err;
 	}
@@ -1135,13 +1337,13 @@ static int test_hash_vec_cfg(const char *driver,
 		if (err) {
 			if (err == vec->digest_error)
 				return 0;
-			pr_err("alg: hash: %s digest() failed on test vector %s; expected_error=%d, actual_error=%d, cfg=\"%s\"\n",
+			pr_err("alg: ahash: %s digest() failed on test vector %s; expected_error=%d, actual_error=%d, cfg=\"%s\"\n",
 			       driver, vec_name, vec->digest_error, err,
 			       cfg->name);
 			return err;
 		}
 		if (vec->digest_error) {
-			pr_err("alg: hash: %s digest() unexpectedly succeeded on test vector %s; expected_error=%d, cfg=\"%s\"\n",
+			pr_err("alg: ahash: %s digest() unexpectedly succeeded on test vector %s; expected_error=%d, cfg=\"%s\"\n",
 			       driver, vec_name, vec->digest_error, cfg->name);
 			return -EINVAL;
 		}
@@ -1153,8 +1355,8 @@ static int test_hash_vec_cfg(const char *driver,
 	ahash_request_set_callback(req, req_flags, crypto_req_done, &wait);
 	ahash_request_set_crypt(req, NULL, result, 0);
 	err = do_ahash_op(crypto_ahash_init, req, &wait, cfg->nosimd);
-	err = check_nonfinal_hash_op("init", err, result, digestsize,
-				     driver, vec_name, cfg);
+	err = check_nonfinal_ahash_op("init", err, result, digestsize,
+				      driver, vec_name, cfg);
 	if (err)
 		return err;
 
@@ -1170,9 +1372,9 @@ static int test_hash_vec_cfg(const char *driver,
 						pending_len);
 			err = do_ahash_op(crypto_ahash_update, req, &wait,
 					  divs[i]->nosimd);
-			err = check_nonfinal_hash_op("update", err,
-						     result, digestsize,
-						     driver, vec_name, cfg);
+			err = check_nonfinal_ahash_op("update", err,
+						      result, digestsize,
+						      driver, vec_name, cfg);
 			if (err)
 				return err;
 			pending_sgl = NULL;
@@ -1183,23 +1385,23 @@ static int test_hash_vec_cfg(const char *driver,
 			testmgr_poison(hashstate + statesize,
 				       TESTMGR_POISON_LEN);
 			err = crypto_ahash_export(req, hashstate);
-			err = check_nonfinal_hash_op("export", err,
-						     result, digestsize,
-						     driver, vec_name, cfg);
+			err = check_nonfinal_ahash_op("export", err,
+						      result, digestsize,
+						      driver, vec_name, cfg);
 			if (err)
 				return err;
 			if (!testmgr_is_poison(hashstate + statesize,
 					       TESTMGR_POISON_LEN)) {
-				pr_err("alg: hash: %s export() overran state buffer on test vector %s, cfg=\"%s\"\n",
+				pr_err("alg: ahash: %s export() overran state buffer on test vector %s, cfg=\"%s\"\n",
 				       driver, vec_name, cfg->name);
 				return -EOVERFLOW;
 			}
 
 			testmgr_poison(req->__ctx, crypto_ahash_reqsize(tfm));
 			err = crypto_ahash_import(req, hashstate);
-			err = check_nonfinal_hash_op("import", err,
-						     result, digestsize,
-						     driver, vec_name, cfg);
+			err = check_nonfinal_ahash_op("import", err,
+						      result, digestsize,
+						      driver, vec_name, cfg);
 			if (err)
 				return err;
 		}
@@ -1213,13 +1415,13 @@ static int test_hash_vec_cfg(const char *driver,
 	if (cfg->finalization_type == FINALIZATION_TYPE_FINAL) {
 		/* finish with update() and final() */
 		err = do_ahash_op(crypto_ahash_update, req, &wait, cfg->nosimd);
-		err = check_nonfinal_hash_op("update", err, result, digestsize,
-					     driver, vec_name, cfg);
+		err = check_nonfinal_ahash_op("update", err, result, digestsize,
+					      driver, vec_name, cfg);
 		if (err)
 			return err;
 		err = do_ahash_op(crypto_ahash_final, req, &wait, cfg->nosimd);
 		if (err) {
-			pr_err("alg: hash: %s final() failed with err %d on test vector %s, cfg=\"%s\"\n",
+			pr_err("alg: ahash: %s final() failed with err %d on test vector %s, cfg=\"%s\"\n",
 			       driver, err, vec_name, cfg->name);
 			return err;
 		}
@@ -1227,31 +1429,49 @@ static int test_hash_vec_cfg(const char *driver,
 		/* finish with finup() */
 		err = do_ahash_op(crypto_ahash_finup, req, &wait, cfg->nosimd);
 		if (err) {
-			pr_err("alg: hash: %s finup() failed with err %d on test vector %s, cfg=\"%s\"\n",
+			pr_err("alg: ahash: %s finup() failed with err %d on test vector %s, cfg=\"%s\"\n",
 			       driver, err, vec_name, cfg->name);
 			return err;
 		}
 	}
 
 result_ready:
-	/* Check that the algorithm produced the correct digest */
-	if (memcmp(result, vec->digest, digestsize) != 0) {
-		pr_err("alg: hash: %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
-		       driver, vec_name, cfg->name);
-		return -EINVAL;
-	}
-	if (!testmgr_is_poison(&result[digestsize], TESTMGR_POISON_LEN)) {
-		pr_err("alg: hash: %s overran result buffer on test vector %s, cfg=\"%s\"\n",
-		       driver, vec_name, cfg->name);
-		return -EOVERFLOW;
+	return check_hash_result("ahash", result, digestsize, vec, vec_name,
+				 driver, cfg);
+}
+
+static int test_hash_vec_cfg(const char *driver,
+			     const struct hash_testvec *vec,
+			     const char *vec_name,
+			     const struct testvec_config *cfg,
+			     struct ahash_request *req,
+			     struct shash_desc *desc,
+			     struct test_sglist *tsgl,
+			     u8 *hashstate)
+{
+	int err;
+
+	/*
+	 * For algorithms implemented as "shash", most bugs will be detected by
+	 * both the shash and ahash tests.  Test the shash API first so that the
+	 * failures involve less indirection, so are easier to debug.
+	 */
+
+	if (desc) {
+		err = test_shash_vec_cfg(driver, vec, vec_name, cfg, desc, tsgl,
+					 hashstate);
+		if (err)
+			return err;
 	}
 
-	return 0;
+	return test_ahash_vec_cfg(driver, vec, vec_name, cfg, req, tsgl,
+				  hashstate);
 }
 
 static int test_hash_vec(const char *driver, const struct hash_testvec *vec,
 			 unsigned int vec_num, struct ahash_request *req,
-			 struct test_sglist *tsgl, u8 *hashstate)
+			 struct shash_desc *desc, struct test_sglist *tsgl,
+			 u8 *hashstate)
 {
 	char vec_name[16];
 	unsigned int i;
@@ -1262,7 +1482,7 @@ static int test_hash_vec(const char *driver, const struct hash_testvec *vec,
 	for (i = 0; i < ARRAY_SIZE(default_hash_testvec_configs); i++) {
 		err = test_hash_vec_cfg(driver, vec, vec_name,
 					&default_hash_testvec_configs[i],
-					req, tsgl, hashstate);
+					req, desc, tsgl, hashstate);
 		if (err)
 			return err;
 	}
@@ -1276,7 +1496,7 @@ static int test_hash_vec(const char *driver, const struct hash_testvec *vec,
 			generate_random_testvec_config(&cfg, cfgname,
 						       sizeof(cfgname));
 			err = test_hash_vec_cfg(driver, vec, vec_name, &cfg,
-						req, tsgl, hashstate);
+						req, desc, tsgl, hashstate);
 			if (err)
 				return err;
 		}
@@ -1338,6 +1558,7 @@ static int test_hash_vs_generic_impl(const char *driver,
 				     const char *generic_driver,
 				     unsigned int maxkeysize,
 				     struct ahash_request *req,
+				     struct shash_desc *desc,
 				     struct test_sglist *tsgl,
 				     u8 *hashstate)
 {
@@ -1418,7 +1639,7 @@ static int test_hash_vs_generic_impl(const char *driver,
 		generate_random_testvec_config(&cfg, cfgname, sizeof(cfgname));
 
 		err = test_hash_vec_cfg(driver, &vec, vec_name, &cfg,
-					req, tsgl, hashstate);
+					req, desc, tsgl, hashstate);
 		if (err)
 			goto out;
 		cond_resched();
@@ -1436,6 +1657,7 @@ static int test_hash_vs_generic_impl(const char *driver,
 				     const char *generic_driver,
 				     unsigned int maxkeysize,
 				     struct ahash_request *req,
+				     struct shash_desc *desc,
 				     struct test_sglist *tsgl,
 				     u8 *hashstate)
 {
@@ -1443,32 +1665,81 @@ static int test_hash_vs_generic_impl(const char *driver,
 }
 #endif /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
 
+static int alloc_shash(const char *driver, u32 type, u32 mask,
+		       struct crypto_shash **tfm_ret,
+		       struct shash_desc **desc_ret)
+{
+	struct crypto_shash *tfm;
+	struct shash_desc *desc;
+
+	tfm = crypto_alloc_shash(driver, type, mask);
+	if (IS_ERR(tfm)) {
+		if (PTR_ERR(tfm) == -ENOENT) {
+			/*
+			 * This algorithm is only available through the ahash
+			 * API, not the shash API, so skip the shash tests.
+			 */
+			return 0;
+		}
+		pr_err("alg: hash: failed to allocate shash transform for %s: %ld\n",
+		       driver, PTR_ERR(tfm));
+		return PTR_ERR(tfm);
+	}
+
+	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+	if (!desc) {
+		crypto_free_shash(tfm);
+		return -ENOMEM;
+	}
+	desc->tfm = tfm;
+
+	*tfm_ret = tfm;
+	*desc_ret = desc;
+	return 0;
+}
+
 static int __alg_test_hash(const struct hash_testvec *vecs,
 			   unsigned int num_vecs, const char *driver,
 			   u32 type, u32 mask,
 			   const char *generic_driver, unsigned int maxkeysize)
 {
-	struct crypto_ahash *tfm;
+	struct crypto_ahash *atfm = NULL;
 	struct ahash_request *req = NULL;
+	struct crypto_shash *stfm = NULL;
+	struct shash_desc *desc = NULL;
 	struct test_sglist *tsgl = NULL;
 	u8 *hashstate = NULL;
+	unsigned int statesize;
 	unsigned int i;
 	int err;
 
-	tfm = crypto_alloc_ahash(driver, type, mask);
-	if (IS_ERR(tfm)) {
+	/*
+	 * Always test the ahash API.  This works regardless of whether the
+	 * algorithm is implemented as ahash or shash.
+	 */
+
+	atfm = crypto_alloc_ahash(driver, type, mask);
+	if (IS_ERR(atfm)) {
 		pr_err("alg: hash: failed to allocate transform for %s: %ld\n",
-		       driver, PTR_ERR(tfm));
-		return PTR_ERR(tfm);
+		       driver, PTR_ERR(atfm));
+		return PTR_ERR(atfm);
 	}
 
-	req = ahash_request_alloc(tfm, GFP_KERNEL);
+	req = ahash_request_alloc(atfm, GFP_KERNEL);
 	if (!req) {
 		pr_err("alg: hash: failed to allocate request for %s\n",
 		       driver);
 		err = -ENOMEM;
 		goto out;
 	}
+
+	/*
+	 * If available also test the shash API, to cover corner cases that may
+	 * be missed by testing the ahash API only.
+	 */
+	err = alloc_shash(driver, type, mask, &stfm, &desc);
+	if (err)
+		goto out;
 
 	tsgl = kmalloc(sizeof(*tsgl), GFP_KERNEL);
 	if (!tsgl || init_test_sglist(tsgl) != 0) {
@@ -1480,8 +1751,10 @@ static int __alg_test_hash(const struct hash_testvec *vecs,
 		goto out;
 	}
 
-	hashstate = kmalloc(crypto_ahash_statesize(tfm) + TESTMGR_POISON_LEN,
-			    GFP_KERNEL);
+	statesize = crypto_ahash_statesize(atfm);
+	if (stfm)
+		statesize = max(statesize, crypto_shash_statesize(stfm));
+	hashstate = kmalloc(statesize + TESTMGR_POISON_LEN, GFP_KERNEL);
 	if (!hashstate) {
 		pr_err("alg: hash: failed to allocate hash state buffer for %s\n",
 		       driver);
@@ -1490,20 +1763,23 @@ static int __alg_test_hash(const struct hash_testvec *vecs,
 	}
 
 	for (i = 0; i < num_vecs; i++) {
-		err = test_hash_vec(driver, &vecs[i], i, req, tsgl, hashstate);
+		err = test_hash_vec(driver, &vecs[i], i, req, desc, tsgl,
+				    hashstate);
 		if (err)
 			goto out;
 	}
 	err = test_hash_vs_generic_impl(driver, generic_driver, maxkeysize, req,
-					tsgl, hashstate);
+					desc, tsgl, hashstate);
 out:
 	kfree(hashstate);
 	if (tsgl) {
 		destroy_test_sglist(tsgl);
 		kfree(tsgl);
 	}
+	kfree(desc);
+	crypto_free_shash(stfm);
 	ahash_request_free(req);
-	crypto_free_ahash(tfm);
+	crypto_free_ahash(atfm);
 	return err;
 }
 
@@ -1996,6 +2272,227 @@ static int test_aead(const char *driver, int enc,
 			return err;
 	}
 	return 0;
+}
+
+static int __test_tls(struct crypto_aead *tfm, int enc,
+		      struct tls_testvec *template, unsigned int tcount,
+		      const bool diff_dst)
+{
+	const char *algo = crypto_tfm_alg_driver_name(crypto_aead_tfm(tfm));
+	unsigned int i, k, authsize;
+	char *q;
+	struct aead_request *req;
+	struct scatterlist *sg;
+	struct scatterlist *sgout;
+	const char *e, *d;
+	struct crypto_wait wait;
+	void *input;
+	void *output;
+	void *assoc;
+	char *iv;
+	char *key;
+	char *xbuf[XBUFSIZE];
+	char *xoutbuf[XBUFSIZE];
+	char *axbuf[XBUFSIZE];
+	int ret = -ENOMEM;
+
+	if (testmgr_alloc_buf(xbuf))
+		goto out_noxbuf;
+
+	if (diff_dst && testmgr_alloc_buf(xoutbuf))
+		goto out_nooutbuf;
+
+	if (testmgr_alloc_buf(axbuf))
+		goto out_noaxbuf;
+
+	iv = kzalloc(MAX_IVLEN, GFP_KERNEL);
+	if (!iv)
+		goto out_noiv;
+
+	key = kzalloc(MAX_KEYLEN, GFP_KERNEL);
+	if (!key)
+		goto out_nokey;
+
+	sg = kmalloc(sizeof(*sg) * 8 * (diff_dst ? 2 : 1), GFP_KERNEL);
+	if (!sg)
+		goto out_nosg;
+
+	sgout = sg + 8;
+
+	d = diff_dst ? "-ddst" : "";
+	e = enc ? "encryption" : "decryption";
+
+	crypto_init_wait(&wait);
+
+	req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (!req) {
+		pr_err("alg: tls%s: Failed to allocate request for %s\n",
+		       d, algo);
+		goto out;
+	}
+
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				  crypto_req_done, &wait);
+
+	for (i = 0; i < tcount; i++) {
+		input = xbuf[0];
+		assoc = axbuf[0];
+
+		ret = -EINVAL;
+		if (WARN_ON(template[i].ilen > PAGE_SIZE ||
+			    template[i].alen > PAGE_SIZE))
+			goto out;
+
+		memcpy(assoc, template[i].assoc, template[i].alen);
+		memcpy(input, template[i].input, template[i].ilen);
+
+		if (template[i].iv)
+			memcpy(iv, template[i].iv, MAX_IVLEN);
+		else
+			memset(iv, 0, MAX_IVLEN);
+
+		crypto_aead_clear_flags(tfm, ~0);
+
+		if (template[i].klen > MAX_KEYLEN) {
+			pr_err("alg: aead%s: setkey failed on test %d for %s: key size %d > %d\n",
+			       d, i, algo, template[i].klen, MAX_KEYLEN);
+			ret = -EINVAL;
+			goto out;
+		}
+		memcpy(key, template[i].key, template[i].klen);
+
+		ret = crypto_aead_setkey(tfm, key, template[i].klen);
+		if (!ret == template[i].fail) {
+			pr_err("alg: tls%s: setkey failed on test %d for %s: flags=%x\n",
+			       d, i, algo, crypto_aead_get_flags(tfm));
+			goto out;
+		} else if (ret)
+			continue;
+
+		authsize = 20;
+		ret = crypto_aead_setauthsize(tfm, authsize);
+		if (ret) {
+			pr_err("alg: aead%s: Failed to set authsize to %u on test %d for %s\n",
+			       d, authsize, i, algo);
+			goto out;
+		}
+
+		k = !!template[i].alen;
+		sg_init_table(sg, k + 1);
+		sg_set_buf(&sg[0], assoc, template[i].alen);
+		sg_set_buf(&sg[k], input, (enc ? template[i].rlen :
+					   template[i].ilen));
+		output = input;
+
+		if (diff_dst) {
+			sg_init_table(sgout, k + 1);
+			sg_set_buf(&sgout[0], assoc, template[i].alen);
+
+			output = xoutbuf[0];
+			sg_set_buf(&sgout[k], output,
+				   (enc ? template[i].rlen : template[i].ilen));
+		}
+
+		aead_request_set_crypt(req, sg, (diff_dst) ? sgout : sg,
+				       template[i].ilen, iv);
+
+		aead_request_set_ad(req, template[i].alen);
+
+		ret = crypto_wait_req(enc ? crypto_aead_encrypt(req)
+				      : crypto_aead_decrypt(req), &wait);
+
+		switch (ret) {
+		case 0:
+			if (template[i].novrfy) {
+				/* verification was supposed to fail */
+				pr_err("alg: tls%s: %s failed on test %d for %s: ret was 0, expected -EBADMSG\n",
+				       d, e, i, algo);
+				/* so really, we got a bad message */
+				ret = -EBADMSG;
+				goto out;
+			}
+			break;
+		case -EBADMSG:
+			/* verification failure was expected */
+			if (template[i].novrfy)
+				continue;
+			/* fall through */
+		default:
+			pr_err("alg: tls%s: %s failed on test %d for %s: ret=%d\n",
+			       d, e, i, algo, -ret);
+			goto out;
+		}
+
+		q = output;
+		if (memcmp(q, template[i].result, template[i].rlen)) {
+			pr_err("alg: tls%s: Test %d failed on %s for %s\n",
+			       d, i, e, algo);
+			hexdump(q, template[i].rlen);
+			pr_err("should be:\n");
+			hexdump(template[i].result, template[i].rlen);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+
+out:
+	aead_request_free(req);
+
+	kfree(sg);
+out_nosg:
+	kfree(key);
+out_nokey:
+	kfree(iv);
+out_noiv:
+	testmgr_free_buf(axbuf);
+out_noaxbuf:
+	if (diff_dst)
+		testmgr_free_buf(xoutbuf);
+out_nooutbuf:
+	testmgr_free_buf(xbuf);
+out_noxbuf:
+	return ret;
+}
+
+static int test_tls(struct crypto_aead *tfm, int enc,
+		    struct tls_testvec *template, unsigned int tcount)
+{
+	int ret;
+	/* test 'dst == src' case */
+	ret = __test_tls(tfm, enc, template, tcount, false);
+	if (ret)
+		return ret;
+	/* test 'dst != src' case */
+	return __test_tls(tfm, enc, template, tcount, true);
+}
+
+static int alg_test_tls(const struct alg_test_desc *desc, const char *driver,
+			u32 type, u32 mask)
+{
+	struct crypto_aead *tfm;
+	int err = 0;
+
+	tfm = crypto_alloc_aead(driver, type, mask);
+	if (IS_ERR(tfm)) {
+		pr_err("alg: aead: Failed to load transform for %s: %ld\n",
+			driver, PTR_ERR(tfm));
+		return PTR_ERR(tfm);
+	}
+
+	if (desc->suite.tls.enc.vecs) {
+		err = test_tls(tfm, ENCRYPT, desc->suite.tls.enc.vecs,
+				desc->suite.tls.enc.count);
+		if (err)
+			goto out;
+	}
+
+	if (!err && desc->suite.tls.dec.vecs)
+		err = test_tls(tfm, DECRYPT, desc->suite.tls.dec.vecs,
+			       desc->suite.tls.dec.count);
+
+out:
+	crypto_free_aead(tfm);
+	return err;
 }
 
 static int alg_test_aead(const struct alg_test_desc *desc, const char *driver,
@@ -4697,6 +5194,15 @@ static const struct alg_test_desc alg_test_descs[] = {
 			.hash = __VECS(tgr192_tv_template)
 		}
 	}, {
+		.alg = "tls10(hmac(sha1),cbc(aes))",
+		.test = alg_test_tls,
+		.suite = {
+			.tls = {
+				.enc = __VECS(tls_enc_tv_template),
+				.dec = __VECS(tls_dec_tv_template)
+			}
+		}
+	}, {
 		.alg = "vmac64(aes)",
 		.test = alg_test_hash,
 		.suite = {
@@ -4789,6 +5295,13 @@ static const struct alg_test_desc alg_test_descs[] = {
 		.alg = "xts512(paes)",
 		.test = alg_test_null,
 		.fips_allowed = 1,
+	}, {
+		.alg = "xxhash64",
+		.test = alg_test_hash,
+		.fips_allowed = 1,
+		.suite = {
+			.hash = __VECS(xxhash64_tv_template)
+		}
 	}, {
 		.alg = "zlib-deflate",
 		.test = alg_test_comp,

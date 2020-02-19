@@ -224,12 +224,23 @@ static const u32 ocelot_sys_regmap[] = {
 	REG(SYS_PTP_CFG,                   0x0006c4),
 };
 
+static const u32 ocelot_s2_regmap[] = {
+	REG(S2_CORE_UPDATE_CTRL,           0x000000),
+	REG(S2_CORE_MV_CFG,                0x000004),
+	REG(S2_CACHE_ENTRY_DAT,            0x000008),
+	REG(S2_CACHE_MASK_DAT,             0x000108),
+	REG(S2_CACHE_ACTION_DAT,           0x000208),
+	REG(S2_CACHE_CNT_DAT,              0x000308),
+	REG(S2_CACHE_TG_DAT,               0x000388),
+};
+
 static const u32 *ocelot_regmap[] = {
 	[ANA] = ocelot_ana_regmap,
 	[QS] = ocelot_qs_regmap,
 	[QSYS] = ocelot_qsys_regmap,
 	[REW] = ocelot_rew_regmap,
 	[SYS] = ocelot_sys_regmap,
+	[S2] = ocelot_s2_regmap,
 };
 
 static const struct reg_field ocelot_regfields[] = {
@@ -401,6 +412,26 @@ static void ocelot_pll5_init(struct ocelot *ocelot)
 		     HSIO_PLL5G_CFG2_AMPC_SEL(0x10));
 }
 
+static void ocelot_port_pcs_init(struct ocelot_port *port)
+{
+	/* Disable HDX fast control */
+	ocelot_port_writel(port, DEV_PORT_MISC_HDX_FAST_DIS, DEV_PORT_MISC);
+
+	/* SGMII only for now */
+	ocelot_port_writel(port, PCS1G_MODE_CFG_SGMII_MODE_ENA,
+			   PCS1G_MODE_CFG);
+	ocelot_port_writel(port, PCS1G_SD_CFG_SD_SEL, PCS1G_SD_CFG);
+
+	/* Enable PCS */
+	ocelot_port_writel(port, PCS1G_CFG_PCS_ENA, PCS1G_CFG);
+
+	/* No aneg on SGMII */
+	ocelot_port_writel(port, 0, PCS1G_ANEG_CFG);
+
+	/* No loopback */
+	ocelot_port_writel(port, 0, PCS1G_LB_CFG);
+}
+
 int ocelot_chip_init(struct ocelot *ocelot)
 {
 	int ret;
@@ -409,6 +440,7 @@ int ocelot_chip_init(struct ocelot *ocelot)
 	ocelot->stats_layout = ocelot_stats_layout;
 	ocelot->num_stats = ARRAY_SIZE(ocelot_stats_layout);
 	ocelot->shared_queue_sz = 224 * 1024;
+	ocelot->port_pcs_init = ocelot_port_pcs_init;
 
 	ret = ocelot_regfields_init(ocelot, ocelot_regfields);
 	if (ret)

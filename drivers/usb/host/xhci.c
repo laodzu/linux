@@ -1679,13 +1679,38 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 			ret = -ENOMEM;
 			goto done;
 		}
-		ep->ep_state |= EP_STOP_CMD_PENDING;
-		ep->stop_cmd_timer.expires = jiffies +
+		/*
+		 *erratum A-009611: Issuing an End Transfer command on an IN
+		 *endpoint. when a transfer is in progress on USB blocks the
+		 *transmission.
+		 *Workaround: Software must wait for all existing TRBs to
+		 *complete before issuing End transfer command.
+		 */
+		if ((ep_ring->enqueue == ep_ring->dequeue &&
+				(xhci->quirks & XHCI_STOP_TRANSFER_IN_BLOCK)) ||
+				!(xhci->quirks & XHCI_STOP_TRANSFER_IN_BLOCK)) {
+			ep->ep_state |= EP_STOP_CMD_PENDING;
+			ep->stop_cmd_timer.expires = jiffies +
 			XHCI_STOP_EP_CMD_TIMEOUT * HZ;
-		add_timer(&ep->stop_cmd_timer);
-		xhci_queue_stop_endpoint(xhci, command, urb->dev->slot_id,
-					 ep_index, 0);
-		xhci_ring_cmd_db(xhci);
+			add_timer(&ep->stop_cmd_timer);
+			xhci_queue_stop_endpoint(xhci, command,
+					urb->dev->slot_id,
+					ep_index, 0);
+			xhci_ring_cmd_db(xhci);
+		}
+
+		/*
+		 *erratum A-009668: Stop Endpoint Command does not complete.
+		 *Workaround: Instead of issuing a Stop Endpoint Command,
+		 *issue a Disable Slot Command with the corresponding slot ID.
+		 *Alternately, you can issue an Address Device Command with
+		 *BSR=1
+		 */
+		if ((urb->dev->speed <= USB_SPEED_HIGH) &&
+					(xhci->quirks & XHCI_STOP_EP_IN_U1)) {
+			xhci_queue_slot_control(xhci, command, TRB_DISABLE_SLOT,
+				urb->dev->slot_id);
+		}
 	}
 done:
 	spin_unlock_irqrestore(&xhci->lock, flags);
@@ -4125,6 +4150,8 @@ static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
 	/* Zero the input context control for later use */
 	ctrl_ctx->add_flags = 0;
 	ctrl_ctx->drop_flags = 0;
+	slot_ctx = xhci_get_slot_ctx(xhci, virt_dev->out_ctx);
+	udev->devaddr = (u8)(le32_to_cpu(slot_ctx->dev_state) & DEV_ADDR_MASK);
 
 	xhci_dbg_trace(xhci, trace_xhci_dbg_address,
 		       "Internal device address = %d",
@@ -5161,6 +5188,26 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 }
 EXPORT_SYMBOL_GPL(xhci_gen_setup);
 
+static void xhci_clear_tt_buffer_complete(struct usb_hcd *hcd,
+		struct usb_host_endpoint *ep)
+{
+	struct xhci_hcd *xhci;
+	struct usb_device *udev;
+	unsigned int slot_id;
+	unsigned int ep_index;
+	unsigned long flags;
+
+	xhci = hcd_to_xhci(hcd);
+	udev = (struct usb_device *)ep->hcpriv;
+	slot_id = udev->slot_id;
+	ep_index = xhci_get_endpoint_index(&ep->desc);
+
+	spin_lock_irqsave(&xhci->lock, flags);
+	xhci->devs[slot_id]->eps[ep_index].ep_state &= ~EP_CLEARING_TT;
+	xhci_ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+	spin_unlock_irqrestore(&xhci->lock, flags);
+}
+
 static const struct hc_driver xhci_hc_driver = {
 	.description =		"xhci-hcd",
 	.product_desc =		"xHCI Host Controller",
@@ -5222,6 +5269,7 @@ static const struct hc_driver xhci_hc_driver = {
 	.enable_usb3_lpm_timeout =	xhci_enable_usb3_lpm_timeout,
 	.disable_usb3_lpm_timeout =	xhci_disable_usb3_lpm_timeout,
 	.find_raw_port_number =	xhci_find_raw_port_number,
+	.clear_tt_buffer_complete = xhci_clear_tt_buffer_complete,
 };
 
 void xhci_init_driver(struct hc_driver *drv,

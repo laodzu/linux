@@ -28,8 +28,6 @@
 #include <net/protocol.h>
 #include <net/netevent.h>
 
-static int zero;
-static int one = 1;
 static int two = 2;
 static int four = 4;
 static int thousand = 1000;
@@ -277,55 +275,97 @@ static int proc_allowed_congestion_control(struct ctl_table *ctl,
 	return ret;
 }
 
+static int sscanf_key(char *buf, __le32 *key)
+{
+	u32 user_key[4];
+	int i, ret = 0;
+
+	if (sscanf(buf, "%x-%x-%x-%x", user_key, user_key + 1,
+		   user_key + 2, user_key + 3) != 4) {
+		ret = -EINVAL;
+	} else {
+		for (i = 0; i < ARRAY_SIZE(user_key); i++)
+			key[i] = cpu_to_le32(user_key[i]);
+	}
+	pr_debug("proc TFO key set 0x%x-%x-%x-%x <- 0x%s: %u\n",
+		 user_key[0], user_key[1], user_key[2], user_key[3], buf, ret);
+
+	return ret;
+}
+
 static int proc_tcp_fastopen_key(struct ctl_table *table, int write,
 				 void __user *buffer, size_t *lenp,
 				 loff_t *ppos)
 {
 	struct net *net = container_of(table->data, struct net,
 	    ipv4.sysctl_tcp_fastopen);
-	struct ctl_table tbl = { .maxlen = (TCP_FASTOPEN_KEY_LENGTH * 2 + 10) };
-	struct tcp_fastopen_context *ctxt;
-	u32  user_key[4]; /* 16 bytes, matching TCP_FASTOPEN_KEY_LENGTH */
-	__le32 key[4];
-	int ret, i;
+	/* maxlen to print the list of keys in hex (*2), with dashes
+	 * separating doublewords and a comma in between keys.
+	 */
+	struct ctl_table tbl = { .maxlen = ((TCP_FASTOPEN_KEY_LENGTH *
+					    2 * TCP_FASTOPEN_KEY_MAX) +
+					    (TCP_FASTOPEN_KEY_MAX * 5)) };
+	struct tcp_fastopen_context *ctx;
+	u32 user_key[TCP_FASTOPEN_KEY_MAX * 4];
+	__le32 key[TCP_FASTOPEN_KEY_MAX * 4];
+	char *backup_data;
+	int ret, i = 0, off = 0, n_keys = 0;
 
 	tbl.data = kmalloc(tbl.maxlen, GFP_KERNEL);
 	if (!tbl.data)
 		return -ENOMEM;
 
 	rcu_read_lock();
-	ctxt = rcu_dereference(net->ipv4.tcp_fastopen_ctx);
-	if (ctxt)
-		memcpy(key, ctxt->key, TCP_FASTOPEN_KEY_LENGTH);
-	else
-		memset(key, 0, sizeof(key));
+	ctx = rcu_dereference(net->ipv4.tcp_fastopen_ctx);
+	if (ctx) {
+		n_keys = tcp_fastopen_context_len(ctx);
+		memcpy(&key[0], &ctx->key[0], TCP_FASTOPEN_KEY_LENGTH * n_keys);
+	}
 	rcu_read_unlock();
 
-	for (i = 0; i < ARRAY_SIZE(key); i++)
+	if (!n_keys) {
+		memset(&key[0], 0, TCP_FASTOPEN_KEY_LENGTH);
+		n_keys = 1;
+	}
+
+	for (i = 0; i < n_keys * 4; i++)
 		user_key[i] = le32_to_cpu(key[i]);
 
-	snprintf(tbl.data, tbl.maxlen, "%08x-%08x-%08x-%08x",
-		user_key[0], user_key[1], user_key[2], user_key[3]);
+	for (i = 0; i < n_keys; i++) {
+		off += snprintf(tbl.data + off, tbl.maxlen - off,
+				"%08x-%08x-%08x-%08x",
+				user_key[i * 4],
+				user_key[i * 4 + 1],
+				user_key[i * 4 + 2],
+				user_key[i * 4 + 3]);
+		if (i + 1 < n_keys)
+			off += snprintf(tbl.data + off, tbl.maxlen - off, ",");
+	}
+
 	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
 
 	if (write && ret == 0) {
-		if (sscanf(tbl.data, "%x-%x-%x-%x", user_key, user_key + 1,
-			   user_key + 2, user_key + 3) != 4) {
+		backup_data = strchr(tbl.data, ',');
+		if (backup_data) {
+			*backup_data = '\0';
+			backup_data++;
+		}
+		if (sscanf_key(tbl.data, key)) {
 			ret = -EINVAL;
 			goto bad_key;
 		}
-
-		for (i = 0; i < ARRAY_SIZE(user_key); i++)
-			key[i] = cpu_to_le32(user_key[i]);
-
+		if (backup_data) {
+			if (sscanf_key(backup_data, key + 4)) {
+				ret = -EINVAL;
+				goto bad_key;
+			}
+		}
 		tcp_fastopen_reset_cipher(net, NULL, key,
+					  backup_data ? key + 4 : NULL,
 					  TCP_FASTOPEN_KEY_LENGTH);
 	}
 
 bad_key:
-	pr_debug("proc FO key set 0x%x-%x-%x-%x <- 0x%s: %u\n",
-		user_key[0], user_key[1], user_key[2], user_key[3],
-	       (char *)tbl.data, ret);
 	kfree(tbl.data);
 	return ret;
 }
@@ -533,7 +573,7 @@ static struct ctl_table ipv4_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 	},
 	{
 		.procname	= "icmp_msgs_burst",
@@ -541,7 +581,7 @@ static struct ctl_table ipv4_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 	},
 	{
 		.procname	= "udp_mem",
@@ -619,8 +659,8 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 #endif
 	{
@@ -708,8 +748,8 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler   = ipv4_fwd_update_priority,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 	{
 		.procname	= "ip_nonlocal_bind",
@@ -739,8 +779,8 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 #endif
 	{
@@ -800,7 +840,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one
+		.extra1		= SYSCTL_ONE
 	},
 #endif
 	{
@@ -905,7 +945,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 		.extra2		= &two,
 	},
 	{
@@ -933,7 +973,12 @@ static struct ctl_table ipv4_net_table[] = {
 		.procname	= "tcp_fastopen_key",
 		.mode		= 0600,
 		.data		= &init_net.ipv4.sysctl_tcp_fastopen,
-		.maxlen		= ((TCP_FASTOPEN_KEY_LENGTH * 2) + 10),
+		/* maxlen to print the list of keys in hex (*2), with dashes
+		 * separating doublewords and a comma in between keys.
+		 */
+		.maxlen		= ((TCP_FASTOPEN_KEY_LENGTH *
+				   2 * TCP_FASTOPEN_KEY_MAX) +
+				   (TCP_FASTOPEN_KEY_MAX * 5)),
 		.proc_handler	= proc_tcp_fastopen_key,
 	},
 	{
@@ -942,7 +987,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_tfo_blackhole_detect_timeout,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 	},
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 	{
@@ -951,8 +996,8 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 	{
 		.procname	= "fib_multipath_hash_policy",
@@ -960,8 +1005,8 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_fib_multipath_hash_policy,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 #endif
 	{
@@ -978,8 +1023,8 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 #endif
 	{
@@ -1009,7 +1054,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 		.extra2		= &four,
 	},
 	{
@@ -1153,7 +1198,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one,
+		.extra1		= SYSCTL_ONE,
 		.extra2		= &gso_max_segs,
 	},
 	{
@@ -1162,7 +1207,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 		.extra2		= &one_day_secs
 	},
 	{
@@ -1171,8 +1216,8 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 	{
 		.procname	= "tcp_invalid_ratelimit",
@@ -1187,7 +1232,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 		.extra2		= &thousand,
 	},
 	{
@@ -1196,7 +1241,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 		.extra2		= &thousand,
 	},
 	{
@@ -1205,7 +1250,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(init_net.ipv4.sysctl_tcp_wmem),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one,
+		.extra1		= SYSCTL_ONE,
 	},
 	{
 		.procname	= "tcp_rmem",
@@ -1213,7 +1258,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(init_net.ipv4.sysctl_tcp_rmem),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one,
+		.extra1		= SYSCTL_ONE,
 	},
 	{
 		.procname	= "tcp_comp_sack_delay_ns",
@@ -1228,7 +1273,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
+		.extra1		= SYSCTL_ZERO,
 		.extra2		= &comp_sack_nr_max,
 	},
 	{
@@ -1237,7 +1282,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(init_net.ipv4.sysctl_udp_rmem_min),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one
+		.extra1		= SYSCTL_ONE
 	},
 	{
 		.procname	= "udp_wmem_min",
@@ -1245,7 +1290,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(init_net.ipv4.sysctl_udp_wmem_min),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one
+		.extra1		= SYSCTL_ONE
 	},
 	{ }
 };

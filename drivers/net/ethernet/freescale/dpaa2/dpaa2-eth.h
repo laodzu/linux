@@ -6,6 +6,7 @@
 #ifndef __DPAA2_ETH_H
 #define __DPAA2_ETH_H
 
+#include <linux/dcbnl.h>
 #include <linux/netdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/fsl/mc.h>
@@ -35,24 +36,27 @@
 /* Convert L3 MTU to L2 MFL */
 #define DPAA2_ETH_L2_MAX_FRM(mtu)	((mtu) + VLAN_ETH_HLEN)
 
-/* Set the taildrop threshold (in bytes) to allow the enqueue of several jumbo
- * frames in the Rx queues (length of the current frame is not
- * taken into account when making the taildrop decision)
+/* Maximum burst size value for Tx shaping */
+#define DPAA2_ETH_MAX_BURST_SIZE	0xF7FF
+
+/* Set the taildrop threshold to 1MB to allow the enqueue of a sufficiently
+ * large number of jumbo frames in the Rx queues (length of the current frame
+ * is not taken into account when making the taildrop decision)
  */
-#define DPAA2_ETH_TAILDROP_THRESH	(64 * 1024)
+#define DPAA2_ETH_TAILDROP_THRESH	(1024 * 1024)
 
 /* Maximum number of Tx confirmation frames to be processed
  * in a single NAPI call
  */
 #define DPAA2_ETH_TXCONF_PER_NAPI	256
 
-/* Buffer quota per queue. Must be large enough such that for minimum sized
- * frames taildrop kicks in before the bpool gets depleted, so we compute
- * how many 64B frames fit inside the taildrop threshold and add a margin
- * to accommodate the buffer refill delay.
+/* Buffer quota per channel.
+ * We want to keep in check number of ingress frames in flight: for small
+ * sized frames, buffer pool depletion will kick in first; for large sizes,
+ * Rx FQ taildrop threshold will ensure only a reasonable number of frames
+ * will be pending at any given time.
  */
-#define DPAA2_ETH_MAX_FRAMES_PER_QUEUE	(DPAA2_ETH_TAILDROP_THRESH / 64)
-#define DPAA2_ETH_NUM_BUFS		(DPAA2_ETH_MAX_FRAMES_PER_QUEUE + 256)
+#define DPAA2_ETH_NUM_BUFS		1024
 #define DPAA2_ETH_REFILL_THRESH \
 	(DPAA2_ETH_NUM_BUFS - DPAA2_ETH_BUFS_PER_CMD)
 
@@ -155,6 +159,49 @@ struct dpaa2_fas {
  */
 #define DPAA2_TS_OFFSET			0x8
 
+/* Frame annotation parse results */
+struct dpaa2_fapr {
+	/* 64-bit word 1 */
+	__le32 faf_lo;
+	__le16 faf_ext;
+	__le16 nxt_hdr;
+	/* 64-bit word 2 */
+	__le64 faf_hi;
+	/* 64-bit word 3 */
+	u8 last_ethertype_offset;
+	u8 vlan_tci_offset_n;
+	u8 vlan_tci_offset_1;
+	u8 llc_snap_offset;
+	u8 eth_offset;
+	u8 ip1_pid_offset;
+	u8 shim_offset_2;
+	u8 shim_offset_1;
+	/* 64-bit word 4 */
+	u8 l5_offset;
+	u8 l4_offset;
+	u8 gre_offset;
+	u8 l3_offset_n;
+	u8 l3_offset_1;
+	u8 mpls_offset_n;
+	u8 mpls_offset_1;
+	u8 pppoe_offset;
+	/* 64-bit word 5 */
+	__le16 running_sum;
+	__le16 gross_running_sum;
+	u8 ipv6_frag_offset;
+	u8 nxt_hdr_offset;
+	u8 routing_hdr_offset_2;
+	u8 routing_hdr_offset_1;
+	/* 64-bit word 6 */
+	u8 reserved[5]; /* Soft-parsing context */
+	u8 ip_proto_offset_n;
+	u8 nxt_hdr_frag_offset;
+	u8 parse_error_code;
+};
+
+#define DPAA2_FAPR_OFFSET		0x10
+#define DPAA2_FAPR_SIZE			sizeof((struct dpaa2_fapr))
+
 /* Frame annotation egress action descriptor */
 #define DPAA2_FAEAD_OFFSET		0x58
 
@@ -183,6 +230,11 @@ static inline struct dpaa2_fas *dpaa2_get_fas(void *buf_addr, bool swa)
 static inline __le64 *dpaa2_get_ts(void *buf_addr, bool swa)
 {
 	return dpaa2_get_hwa(buf_addr, swa) + DPAA2_TS_OFFSET;
+}
+
+static inline struct dpaa2_fapr *dpaa2_get_fapr(void *buf_addr, bool swa)
+{
+	return dpaa2_get_hwa(buf_addr, swa) + DPAA2_FAPR_OFFSET;
 }
 
 static inline struct dpaa2_faead *dpaa2_get_faead(void *buf_addr, bool swa)
@@ -236,6 +288,9 @@ static inline struct dpaa2_faead *dpaa2_get_faead(void *buf_addr, bool swa)
 					 DPAA2_FAS_L3CE		| \
 					 DPAA2_FAS_L4CE)
 
+/* TCP indication in Frame Annotation Parse Results */
+#define DPAA2_FAF_HI_TCP_PRESENT	BIT(23)
+
 /* Time in milliseconds between link state updates */
 #define DPAA2_ETH_LINK_STATE_REFRESH	1000
 
@@ -279,19 +334,27 @@ struct dpaa2_eth_ch_stats {
 	__u64 xdp_tx;
 	__u64 xdp_tx_err;
 	__u64 xdp_redirect;
+	/* Must be last, does not show up in ethtool stats */
+	__u64 frames;
 };
 
 /* Maximum number of queues associated with a DPNI */
-#define DPAA2_ETH_MAX_RX_QUEUES		16
+#define DPAA2_ETH_MAX_TCS		8
 #define DPAA2_ETH_MAX_TX_QUEUES		16
+#define DPAA2_ETH_MAX_RX_QUEUES		(DPNI_MAX_DIST_SIZE * DPAA2_ETH_MAX_TCS)
+#define DPAA2_ETH_MAX_RX_ERR_QUEUES	1
 #define DPAA2_ETH_MAX_QUEUES		(DPAA2_ETH_MAX_RX_QUEUES + \
-					DPAA2_ETH_MAX_TX_QUEUES)
+					DPAA2_ETH_MAX_TX_QUEUES + \
+					DPAA2_ETH_MAX_RX_ERR_QUEUES)
+#define DPAA2_ETH_MAX_NETDEV_QUEUES	\
+	(DPAA2_ETH_MAX_TX_QUEUES * DPAA2_ETH_MAX_TCS)
 
 #define DPAA2_ETH_MAX_DPCONS		16
 
 enum dpaa2_eth_fq_type {
 	DPAA2_RX_FQ = 0,
 	DPAA2_TX_CONF_FQ,
+	DPAA2_RX_ERR_FQ
 };
 
 struct dpaa2_eth_priv;
@@ -299,8 +362,9 @@ struct dpaa2_eth_priv;
 struct dpaa2_eth_fq {
 	u32 fqid;
 	u32 tx_qdbin;
-	u32 tx_fqid;
+	u32 tx_fqid[DPAA2_ETH_MAX_TCS];
 	u16 flowid;
+	u8 tc;
 	int target_cpu;
 	u32 dq_frames;
 	u32 dq_bytes;
@@ -402,6 +466,14 @@ struct dpaa2_eth_priv {
 #ifdef CONFIG_DEBUG_FS
 	struct dpaa2_debugfs dbg;
 #endif
+	struct dpni_tx_shaping_cfg shaping_cfg;
+
+	u8 dcbx_mode;
+	struct ieee_pfc pfc;
+	bool vlan_clsf_set;
+	bool tx_pause_frames;
+
+	bool ceetm_en;
 };
 
 #define DPAA2_RXH_SUPPORTED	(RXH_L2DA | RXH_VLAN | RXH_L3_PROTO \
@@ -447,6 +519,9 @@ static inline int dpaa2_eth_cmp_dpni_ver(struct dpaa2_eth_priv *priv,
 
 #define dpaa2_eth_fs_count(priv)        \
 	((priv)->dpni_attrs.fs_entries)
+
+#define dpaa2_eth_tc_count(priv)	\
+	((priv)->dpni_attrs.num_tcs)
 
 /* We have exactly one {Rx, Tx conf} queue per channel */
 #define dpaa2_eth_queue_count(priv)     \
@@ -502,10 +577,41 @@ static inline unsigned int dpaa2_eth_rx_head_room(struct dpaa2_eth_priv *priv)
 	return priv->tx_data_offset - DPAA2_ETH_RX_HWA_SIZE;
 }
 
+static inline bool dpaa2_eth_is_pfc_enabled(struct dpaa2_eth_priv *priv,
+					    int traffic_class)
+{
+	return priv->pfc.pfc_en & (1 << traffic_class);
+}
+
+enum dpaa2_eth_td_cfg {
+	DPAA2_ETH_TD_NONE,
+	DPAA2_ETH_TD_QUEUE,
+	DPAA2_ETH_TD_GROUP
+};
+
+static inline enum dpaa2_eth_td_cfg
+dpaa2_eth_get_td_type(struct dpaa2_eth_priv *priv)
+{
+	bool pfc_enabled = !!(priv->pfc.pfc_en);
+
+	if (pfc_enabled)
+		return DPAA2_ETH_TD_GROUP;
+	else if (priv->tx_pause_frames)
+		return DPAA2_ETH_TD_NONE;
+	else
+		return DPAA2_ETH_TD_QUEUE;
+}
+
+static inline int dpaa2_eth_ch_count(struct dpaa2_eth_priv *priv)
+{
+	return 1;
+}
+
 int dpaa2_eth_set_hash(struct net_device *net_dev, u64 flags);
 int dpaa2_eth_set_cls(struct net_device *net_dev, u64 key);
 int dpaa2_eth_cls_key_size(u64 key);
 int dpaa2_eth_cls_fld_off(int prot, int field);
 void dpaa2_eth_cls_trim_rule(void *key_mem, u64 fields);
+int set_rx_taildrop(struct dpaa2_eth_priv *priv);
 
 #endif	/* __DPAA2_H */

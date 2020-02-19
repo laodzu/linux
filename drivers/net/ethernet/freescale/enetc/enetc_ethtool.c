@@ -190,6 +190,7 @@ static const char rx_ring_stats[][ETH_GSTRING_LEN] = {
 
 static const char tx_ring_stats[][ETH_GSTRING_LEN] = {
 	"Tx ring %2d frames",
+	"Tx window drop %2d frames",
 };
 
 static int enetc_get_sset_count(struct net_device *ndev, int sset)
@@ -255,8 +256,10 @@ static void enetc_get_ethtool_stats(struct net_device *ndev,
 	for (i = 0; i < ARRAY_SIZE(enetc_si_counters); i++)
 		data[o++] = enetc_rd64(hw, enetc_si_counters[i].reg);
 
-	for (i = 0; i < priv->num_tx_rings; i++)
+	for (i = 0; i < priv->num_tx_rings; i++) {
 		data[o++] = priv->tx_ring[i]->stats.packets;
+		data[o++] = priv->tx_ring[i]->stats.win_drop;
+	}
 
 	for (i = 0; i < priv->num_rx_rings; i++) {
 		data[o++] = priv->rx_ring[i]->stats.packets;
@@ -555,6 +558,35 @@ static void enetc_get_ringparam(struct net_device *ndev,
 	}
 }
 
+static int enetc_get_ts_info(struct net_device *ndev,
+			     struct ethtool_ts_info *info)
+{
+	int *phc_idx;
+
+	phc_idx = symbol_get(enetc_phc_index);
+	if (phc_idx) {
+		info->phc_index = *phc_idx;
+		symbol_put(enetc_phc_index);
+	} else {
+		info->phc_index = -1;
+	}
+
+#ifdef CONFIG_FSL_ENETC_HW_TIMESTAMPING
+	info->so_timestamping = SOF_TIMESTAMPING_TX_HARDWARE |
+				SOF_TIMESTAMPING_RX_HARDWARE |
+				SOF_TIMESTAMPING_RAW_HARDWARE;
+
+	info->tx_types = (1 << HWTSTAMP_TX_OFF) |
+			 (1 << HWTSTAMP_TX_ON);
+	info->rx_filters = (1 << HWTSTAMP_FILTER_NONE) |
+			   (1 << HWTSTAMP_FILTER_ALL);
+#else
+	info->so_timestamping = SOF_TIMESTAMPING_RX_SOFTWARE |
+				SOF_TIMESTAMPING_SOFTWARE;
+#endif
+	return 0;
+}
+
 static const struct ethtool_ops enetc_pf_ethtool_ops = {
 	.get_regs_len = enetc_get_reglen,
 	.get_regs = enetc_get_regs,
@@ -571,6 +603,7 @@ static const struct ethtool_ops enetc_pf_ethtool_ops = {
 	.get_link_ksettings = phy_ethtool_get_link_ksettings,
 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
 	.get_link = ethtool_op_get_link,
+	.get_ts_info = enetc_get_ts_info,
 };
 
 static const struct ethtool_ops enetc_vf_ethtool_ops = {
@@ -586,6 +619,7 @@ static const struct ethtool_ops enetc_vf_ethtool_ops = {
 	.set_rxfh = enetc_set_rxfh,
 	.get_ringparam = enetc_get_ringparam,
 	.get_link = ethtool_op_get_link,
+	.get_ts_info = enetc_get_ts_info,
 };
 
 void enetc_set_ethtool_ops(struct net_device *ndev)

@@ -10,18 +10,23 @@
 #include <linux/ethtool.h>
 #include <linux/if_vlan.h>
 #include <linux/phy.h>
+#include <net/tsn.h>
 
 #include "enetc_hw.h"
 
 #define ENETC_MAC_MAXFRM_SIZE	9600
 #define ENETC_MAX_MTU		(ENETC_MAC_MAXFRM_SIZE - \
 				(ETH_FCS_LEN + ETH_HLEN + VLAN_HLEN))
+#define ENETC_CLK  400000000
 
 struct enetc_tx_swbd {
 	struct sk_buff *skb;
 	dma_addr_t dma;
 	u16 len;
-	u16 is_dma_page;
+	u8 is_dma_page:1;
+	u8 check_wb:1;
+	u8 do_tstamp:1;
+	u8 qbv_en:1;
 };
 
 #define ENETC_RX_MAXFRM_SIZE	ENETC_MAC_MAXFRM_SIZE
@@ -40,6 +45,7 @@ struct enetc_ring_stats {
 	unsigned int packets;
 	unsigned int bytes;
 	unsigned int rx_alloc_errs;
+	unsigned int win_drop;
 };
 
 #define ENETC_BDR_DEFAULT_SIZE	1024
@@ -109,6 +115,28 @@ struct enetc_msg_swbd {
 	int size;
 };
 
+#ifdef CONFIG_ENETC_TSN
+/* Credit-Based Shaper parameters */
+struct cbs {
+	u8 tc;
+	bool enable;
+	u8 bw;
+	u32 hi_credit;
+	u32 lo_credit;
+	u32 idle_slope;
+	u32 send_slope;
+	u32 tc_max_sized_frame;
+	u32 max_interfrence_size;
+};
+
+struct enetc_cbs {
+	u32 port_transmit_rate;
+	u32 port_max_size_frame;
+	u8 tc_nums;
+	struct cbs cbs[0];
+};
+#endif
+
 #define ENETC_REV1	0x1
 enum enetc_errata {
 	ENETC_ERR_TXCSUM	= BIT(0),
@@ -131,6 +159,11 @@ struct enetc_si {
 	int num_fs_entries;
 	int num_rss; /* number of RSS buckets */
 	unsigned short pad;
+#define ENETC_SI_F_QBV	BIT(0)
+	int hw_features;
+#ifdef CONFIG_ENETC_TSN
+	struct enetc_cbs *ecbs;
+#endif
 };
 
 #define ENETC_SI_ALIGN	32
@@ -167,6 +200,13 @@ struct enetc_cls_rule {
 
 #define ENETC_MAX_BDR_INT	2 /* fixed to max # of available cpus */
 
+/* TODO: more hardware offloads */
+enum enetc_active_offloads {
+	ENETC_F_RX_TSTAMP	= BIT(0),
+	ENETC_F_TX_TSTAMP	= BIT(1),
+	ENETC_F_QBV		= BIT(2),
+};
+
 struct enetc_ndev_priv {
 	struct net_device *ndev;
 	struct device *dev; /* dma-mapping device */
@@ -178,6 +218,7 @@ struct enetc_ndev_priv {
 	u16 rx_bd_count, tx_bd_count;
 
 	u16 msg_enable;
+	int active_offloads;
 
 	struct enetc_bdr *tx_ring[16];
 	struct enetc_bdr *rx_ring[16];
@@ -200,6 +241,9 @@ struct enetc_msg_cmd_set_primary_mac {
 
 #define ENETC_CBDR_TIMEOUT	1000 /* usecs */
 
+/* PTP driver exports */
+extern int enetc_phc_index;
+
 /* SI common */
 int enetc_pci_probe(struct pci_dev *pdev, const char *name, int sizeof_priv);
 void enetc_pci_remove(struct pci_dev *pdev);
@@ -216,6 +260,10 @@ netdev_tx_t enetc_xmit(struct sk_buff *skb, struct net_device *ndev);
 struct net_device_stats *enetc_get_stats(struct net_device *ndev);
 int enetc_set_features(struct net_device *ndev,
 		       netdev_features_t features);
+int enetc_ioctl(struct net_device *ndev, struct ifreq *rq, int cmd);
+int enetc_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+		   void *type_data);
+
 /* ethtool */
 void enetc_set_ethtool_ops(struct net_device *ndev);
 
@@ -228,3 +276,11 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
 void enetc_set_rss_key(struct enetc_hw *hw, const u8 *bytes);
 int enetc_get_rss_table(struct enetc_si *si, u32 *table, int count);
 int enetc_set_rss_table(struct enetc_si *si, const u32 *table, int count);
+
+#ifdef CONFIG_ENETC_TSN
+void enetc_tsn_pf_init(struct net_device *netdev, struct pci_dev *pdev);
+void enetc_tsn_pf_deinit(struct net_device *netdev);
+#else
+#define enetc_tsn_pf_init(netdev, pdev) (void)0
+#define enetc_tsn_pf_deinit(netdev) (void)0
+#endif

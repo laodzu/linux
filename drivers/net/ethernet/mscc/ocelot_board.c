@@ -182,12 +182,13 @@ static int mscc_ocelot_probe(struct platform_device *pdev)
 	struct {
 		enum ocelot_target id;
 		char *name;
-	} res[] = {
+	} io_target[] = {
 		{ SYS, "sys" },
 		{ REW, "rew" },
 		{ QSYS, "qsys" },
 		{ ANA, "ana" },
 		{ QS, "qs" },
+		{ S2, "s2" },
 	};
 
 	if (!np && !pdev->dev.platform_data)
@@ -200,14 +201,18 @@ static int mscc_ocelot_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, ocelot);
 	ocelot->dev = &pdev->dev;
 
-	for (i = 0; i < ARRAY_SIZE(res); i++) {
+	for (i = 0; i < ARRAY_SIZE(io_target); i++) {
 		struct regmap *target;
+		struct resource *res;
 
-		target = ocelot_io_platform_init(ocelot, pdev, res[i].name);
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+						   io_target[i].name);
+
+		target = ocelot_io_init(ocelot, res);
 		if (IS_ERR(target))
 			return PTR_ERR(target);
 
-		ocelot->targets[res[i].id] = target;
+		ocelot->targets[io_target[i].id] = target;
 	}
 
 	hsio = syscon_regmap_lookup_by_compatible("mscc,ocelot-hsio");
@@ -254,10 +259,6 @@ static int mscc_ocelot_probe(struct platform_device *pdev)
 
 	ocelot->num_phys_ports = of_get_child_count(ports);
 
-	ocelot->ports = devm_kcalloc(&pdev->dev, ocelot->num_phys_ports,
-				     sizeof(struct ocelot_port *), GFP_KERNEL);
-
-	INIT_LIST_HEAD(&ocelot->multicast);
 	ocelot_init(ocelot);
 
 	for_each_available_child_of_node(ports, portnp) {

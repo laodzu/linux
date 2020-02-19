@@ -22,13 +22,19 @@
 #define PHY_ID_AQR107	0x03a1b4e0
 #define PHY_ID_AQCS109	0x03a1b5c2
 #define PHY_ID_AQR405	0x03a1b4b0
+#define PHY_ID_AQR112	0x03a1b662
+#define PHY_ID_AQR412	0x03a1b712
 
 #define MDIO_PHYXS_VEND_IF_STATUS		0xe812
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_MASK	GENMASK(7, 3)
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_KR	0
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_XFI	2
+#define MDIO_PHYXS_VEND_IF_STATUS_TYPE_USXGMII	3
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_SGMII	6
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_OCSGMII	10
+
+#define MDIO_PHYXS_VEND_PROV2			0xC441
+#define MDIO_PHYXS_VEND_PROV2_USX_AN		BIT(3)
 
 #define MDIO_AN_VEND_PROV			0xc400
 #define MDIO_AN_VEND_PROV_1000BASET_FULL	BIT(15)
@@ -119,6 +125,29 @@
 #define VEND1_GLOBAL_INT_VEND_MASK_GLOBAL1	BIT(2)
 #define VEND1_GLOBAL_INT_VEND_MASK_GLOBAL2	BIT(1)
 #define VEND1_GLOBAL_INT_VEND_MASK_GLOBAL3	BIT(0)
+
+/* registers in MDIO_MMD_VEND1 region */
+#define AQUANTIA_VND1_GLOBAL_SC			0x000
+#define  AQUANTIA_VND1_GLOBAL_SC_LP		BIT(0xb)
+
+/* global start rate, the protocol associated with this speed is used by default
+ * on SI.
+ */
+#define AQUANTIA_VND1_GSTART_RATE		0x31a
+#define  AQUANTIA_VND1_GSTART_RATE_OFF		0
+#define  AQUANTIA_VND1_GSTART_RATE_100M		1
+#define  AQUANTIA_VND1_GSTART_RATE_1G		2
+#define  AQUANTIA_VND1_GSTART_RATE_10G		3
+#define  AQUANTIA_VND1_GSTART_RATE_2_5G		4
+#define  AQUANTIA_VND1_GSTART_RATE_5G		5
+
+/* SYSCFG registers for 100M, 1G, 2.5G, 5G, 10G */
+#define AQUANTIA_VND1_GSYSCFG_BASE		0x31b
+#define AQUANTIA_VND1_GSYSCFG_100M		0
+#define AQUANTIA_VND1_GSYSCFG_1G		1
+#define AQUANTIA_VND1_GSYSCFG_2_5G		2
+#define AQUANTIA_VND1_GSYSCFG_5G		3
+#define AQUANTIA_VND1_GSYSCFG_10G		4
 
 struct aqr107_hw_stat {
 	const char *name;
@@ -240,6 +269,61 @@ static int aqr_config_aneg(struct phy_device *phydev)
 	return genphy_c45_check_and_restart_aneg(phydev, changed);
 }
 
+static struct {
+	u16 syscfg;
+	int cnt;
+	u16 start_rate;
+} aquantia_syscfg[PHY_INTERFACE_MODE_MAX] = {
+	[PHY_INTERFACE_MODE_SGMII] =      {0x04b, AQUANTIA_VND1_GSYSCFG_1G,
+					   AQUANTIA_VND1_GSTART_RATE_1G},
+	[PHY_INTERFACE_MODE_2500BASEX] = {0x144, AQUANTIA_VND1_GSYSCFG_2_5G,
+					   AQUANTIA_VND1_GSTART_RATE_2_5G},
+	[PHY_INTERFACE_MODE_XGMII] =      {0x100, AQUANTIA_VND1_GSYSCFG_10G,
+					   AQUANTIA_VND1_GSTART_RATE_10G},
+	[PHY_INTERFACE_MODE_USXGMII] =    {0x080, AQUANTIA_VND1_GSYSCFG_10G,
+					   AQUANTIA_VND1_GSTART_RATE_10G},
+};
+
+/* Sets up protocol on system side before calling aqr_config_aneg */
+static int aqr_config_aneg_set_prot(struct phy_device *phydev)
+{
+	int if_type = phydev->interface;
+	int i;
+
+	if (!aquantia_syscfg[if_type].cnt)
+		return 0;
+
+	/* set PHY in low power mode so we can configure protocols */
+	phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GLOBAL_SC,
+		      AQUANTIA_VND1_GLOBAL_SC_LP);
+	mdelay(10);
+
+	/* set the default rate to enable the SI link */
+	phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GSTART_RATE,
+		      aquantia_syscfg[if_type].start_rate);
+
+	for (i = 0; i <= aquantia_syscfg[if_type].cnt; i++) {
+		u16 reg = phy_read_mmd(phydev, MDIO_MMD_VEND1,
+				       AQUANTIA_VND1_GSYSCFG_BASE + i);
+		if (!reg)
+			continue;
+
+		phy_write_mmd(phydev, MDIO_MMD_VEND1,
+			      AQUANTIA_VND1_GSYSCFG_BASE + i,
+			      aquantia_syscfg[if_type].syscfg);
+	}
+
+	if (if_type == PHY_INTERFACE_MODE_USXGMII)
+		phy_write_mmd(phydev, MDIO_MMD_PHYXS, MDIO_PHYXS_VEND_PROV2,
+			      MDIO_PHYXS_VEND_PROV2_USX_AN);
+
+	/* wake PHY back up */
+	phy_write_mmd(phydev, MDIO_MMD_VEND1, AQUANTIA_VND1_GLOBAL_SC, 0);
+	mdelay(10);
+
+	return aqr_config_aneg(phydev);
+}
+
 static int aqr_config_intr(struct phy_device *phydev)
 {
 	bool en = phydev->interrupts == PHY_INTERRUPT_ENABLED;
@@ -359,6 +443,9 @@ static int aqr107_read_status(struct phy_device *phydev)
 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_KR:
 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_XFI:
 		phydev->interface = PHY_INTERFACE_MODE_10GKR;
+		break;
+	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_USXGMII:
+		phydev->interface = PHY_INTERFACE_MODE_USXGMII;
 		break;
 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_SGMII:
 		phydev->interface = PHY_INTERFACE_MODE_SGMII;
@@ -488,8 +575,12 @@ static int aqr107_config_init(struct phy_device *phydev)
 	if (phydev->interface != PHY_INTERFACE_MODE_SGMII &&
 	    phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
 	    phydev->interface != PHY_INTERFACE_MODE_XGMII &&
+	    phydev->interface != PHY_INTERFACE_MODE_USXGMII &&
 	    phydev->interface != PHY_INTERFACE_MODE_10GKR)
 		return -ENODEV;
+
+	WARN(phydev->interface == PHY_INTERFACE_MODE_XGMII,
+	     "Your devicetree is out of date, please update it. The AQR107 family doesn't support XGMII, maybe you mean USXGMII.\n");
 
 	ret = aqr107_wait_reset_complete(phydev);
 	if (!ret)
@@ -672,6 +763,22 @@ static struct phy_driver aqr_driver[] = {
 	.ack_interrupt	= aqr_ack_interrupt,
 	.read_status	= aqr_read_status,
 },
+{
+	PHY_ID_MATCH_MODEL(PHY_ID_AQR112),
+	.name		= "Aquantia AQR112",
+	.config_aneg    = aqr_config_aneg_set_prot,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
+},
+{
+	PHY_ID_MATCH_MODEL(PHY_ID_AQR412),
+	.name		= "Aquantia AQR412",
+	.config_aneg    = aqr_config_aneg_set_prot,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
+},
 };
 
 module_phy_driver(aqr_driver);
@@ -684,6 +791,8 @@ static struct mdio_device_id __maybe_unused aqr_tbl[] = {
 	{ PHY_ID_MATCH_MODEL(PHY_ID_AQR107) },
 	{ PHY_ID_MATCH_MODEL(PHY_ID_AQCS109) },
 	{ PHY_ID_MATCH_MODEL(PHY_ID_AQR405) },
+	{ PHY_ID_MATCH_MODEL(PHY_ID_AQR112) },
+	{ PHY_ID_MATCH_MODEL(PHY_ID_AQR412) },
 	{ }
 };
 
