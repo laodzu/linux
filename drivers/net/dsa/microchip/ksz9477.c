@@ -234,7 +234,7 @@ static int ksz9477_reset_switch(struct ksz_device *dev)
 	  ksz_pwrite32(dev, 6, REG_PORT_SGMII_ADDR__4, reg);
 	  ksz_pread32(dev, 6, REG_PORT_SGMII_DATA__4, &data32);
 	  if (data32 & 0x20) {
-	    dev_printk(KERN_INFO, dev->dev, "dzu autoneg finished");
+	    dev_printk(KERN_INFO, dev->dev, "dzu autoneg finished (cnt=%d)", cnt);
 	    dev_printk(KERN_INFO, dev->dev, "dzu port 6 reg %06x = %08x", reg, data32);
 	    break;
 	  }
