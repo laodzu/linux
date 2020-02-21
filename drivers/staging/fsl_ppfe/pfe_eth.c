@@ -2212,6 +2212,17 @@ pkt_drop:
 	return NULL;
 }
 
+void pfe_dump_skb(struct net_device *dev,
+		  struct sk_buff *skb, char *desc)
+{
+        char hdr[32];
+
+        /* dump the packet */
+        snprintf(hdr, sizeof(hdr), "%6s:%s skb->data:", dev->name, desc);
+        print_hex_dump(KERN_INFO, hdr, DUMP_PREFIX_OFFSET,
+                       16, 1, skb->data, skb->len, true);
+}
+
 /* pfe_eth_poll
  */
 static int pfe_eth_poll(struct pfe_eth_priv_s *priv, struct napi_struct *napi,
@@ -2233,6 +2244,9 @@ static int pfe_eth_poll(struct pfe_eth_priv_s *priv, struct napi_struct *napi,
 
 		if (!skb)
 			break;
+
+		/* dzu */
+		pfe_dump_skb(priv->ndev, skb, "dzu");
 
 		len = skb->len;
 
