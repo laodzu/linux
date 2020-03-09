@@ -98,6 +98,7 @@ typedef enum {
 	PHY_INTERFACE_MODE_XAUI,
 	/* 10GBASE-KR, XFI, SFI - single lane 10G Serdes */
 	PHY_INTERFACE_MODE_10GKR,
+    PHY_INTERFACE_MODE_2500SGMII,
 	PHY_INTERFACE_MODE_MAX,
 } phy_interface_t;
 
