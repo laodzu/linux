@@ -133,13 +133,10 @@
 &spi1 {
 	status = "okay";
 	is-decoded-cs = <0>;
-        num-cs = <9>;
-	/* Chipselects are MIO0, EMIO0-7 */
+        num-cs = <3>;
+	/* Chipselects are MIO9, EMIO0-1 */
         cs-gpios = <&gpio0  9 0>,
-	           <&gpio0 54 0>, <&gpio0 55 0>,
-	           <&gpio0 56 0>, <&gpio0 57 0>,
-	           <&gpio0 58 0>, <&gpio0 59 0>,
-	           <&gpio0 60 0>, <&gpio0 61 0>;
+	           <&gpio0 54 0>, <&gpio0 55 0>;
         spidev@0x00 {
                 compatible = "spidev";
                 spi-max-frequency = <30000000>;
@@ -154,35 +151,5 @@
                 compatible = "spidev";
                 spi-max-frequency = <30000000>;
                 reg = <2>;
-        };
-        spidev@0x03 {
-                compatible = "spidev";
-                spi-max-frequency = <30000000>;
-                reg = <3>;
-        };
-        spidev@0x04 {
-                compatible = "spidev";
-                spi-max-frequency = <30000000>;
-                reg = <4>;
-        };
-        spidev@0x05 {
-                compatible = "spidev";
-                spi-max-frequency = <30000000>;
-                reg = <5>;
-        };
-        spidev@0x06 {
-                compatible = "spidev";
-                spi-max-frequency = <30000000>;
-                reg = <6>;
-        };
-        spidev@0x07 {
-                compatible = "spidev";
-                spi-max-frequency = <30000000>;
-                reg = <7>;
-        };
-        spidev@0x08 {
-                compatible = "spidev";
-                spi-max-frequency = <30000000>;
-                reg = <8>;
         };
 };
